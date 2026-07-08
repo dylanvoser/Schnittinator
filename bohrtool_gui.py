@@ -6,12 +6,15 @@ Start:  python bohrtool_gui.py
 
 Bedienung Grafik:
   Mausrad            = Zoom um den Cursor
-  Linke Maustaste    = Ansicht verschieben
+  Rechte Maustaste   = Ansicht verschieben
+  Linke Maustaste    = Bohrung anklicken -> für Schnitt B (manuell) auswählen/abwählen
   Häuschen (Toolbar) = Gesamtansicht, Markierung wird entfernt
   Pfeile ◀ ▶         = zwischen letzten Ansichten wechseln
 Seitenleiste und Teilbereiche sind an den Trennstegen frei verstellbar.
+Bohrtabelle: 👁-Spalte blendet einzelne Bohrnummern aus/ein, Kopf-Knopf alle.
 """
 import csv
+import math
 import threading
 import queue
 import time
@@ -61,6 +64,10 @@ class App(tk.Tk):
         self.thread_overrides = {}
         self.force_keys = set()
         self.skip_keys = set()
+        self.hidden_keys = set()
+        self.deleted_keys = set()
+        self._delete_stack = []
+        self.manual_selection = []       # Feature-Objekte fuer Schnitt B
         self._section_feats = []
         self._hl_artist = None
         self._pan_start = None
@@ -145,6 +152,13 @@ class App(tk.Tk):
             ttk.Button(top, text=f"⬇ {txt}", command=cmd)\
                 .pack(side="right", padx=3)
 
+        hint = ttk.Frame(self, padding=(10, 0))
+        hint.pack(side="top", fill="x")
+        ttk.Label(hint, style="Status.TLabel",
+                  text="Rechtsklick: Ansicht verschieben  ·  "
+                       "Linksklick auf Bohrung: für Schnitt B (manuell) "
+                       "auswählen/abwählen").pack(side="left")
+
         # -------- Hauptbereich: horizontal verstellbar ---------------------
         main = ttk.PanedWindow(self, orient="horizontal")
         main.pack(fill="both", expand=True, padx=8, pady=(0, 4))
@@ -155,15 +169,22 @@ class App(tk.Tk):
 
         f_types = ttk.Frame(left, style="Panel.TFrame", padding=6)
         left.add(f_types, weight=2)
-        ttk.Label(f_types, text="Bohrtabelle (Typen)",
-                  style="Head.TLabel").pack(anchor="w")
-        cols = ("Nr", "Bezeichnung", "Durchmesser", "Art", "Tiefe", "Anzahl")
+        hdr = ttk.Frame(f_types, style="Panel.TFrame")
+        hdr.pack(fill="x")
+        ttk.Label(hdr, text="Bohrtabelle (Typen)",
+                  style="Head.TLabel").pack(side="left")
+        ttk.Button(hdr, text="👁 Alle Nummern ein-/ausblenden",
+                   command=self._toggle_all_labels).pack(side="right")
+        cols = ("Nr", "Bezeichnung", "Durchmesser", "Art", "Tiefe", "Anzahl",
+                "👁")
         self.tree = ttk.Treeview(f_types, columns=cols, show="headings")
-        for c, w in zip(cols, (40, 90, 90, 200, 55, 55)):
+        for c, w in zip(cols, (40, 90, 90, 190, 55, 55, 30)):
             self.tree.heading(c, text=c)
-            self.tree.column(c, width=w, anchor="center", stretch=True)
+            self.tree.column(c, width=w, anchor="center", stretch=(c != "👁"))
+        self._eye_col_id = f"#{len(cols)}"
         self.tree.pack(fill="both", expand=True, pady=(4, 4))
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_click)
+        self.tree.bind("<Button-1>", self._on_tree_button1)
         ttk.Button(f_types, text="⇄  Typ umschalten: Gewinde / Bohrung",
                    command=self.toggle_thread).pack(fill="x")
         row = ttk.Frame(f_types, style="Panel.TFrame")
@@ -174,19 +195,64 @@ class App(tk.Tk):
         ttk.Button(row, text="∅ Nicht nötig",
                    command=lambda: self._mark_type("skip"))\
             .pack(side="left", fill="x", expand=True, padx=(2, 0))
+        row2 = ttk.Frame(f_types, style="Panel.TFrame")
+        row2.pack(fill="x", pady=(4, 0))
+        ttk.Button(row2, text="🗑 Bohrung löschen (falsch erkannt)",
+                   command=self._delete_selected_type)\
+            .pack(side="left", fill="x", expand=True, padx=(0, 2))
+        ttk.Button(row2, text="↺ Löschung rückgängig",
+                   command=self._undo_delete)\
+            .pack(side="left", fill="x", expand=True, padx=(2, 0))
 
         f_sec = ttk.Frame(left, style="Panel.TFrame", padding=6)
         left.add(f_sec, weight=2)
         ttk.Label(f_sec, text="Bohrungen im Schnitt  (Klick = hinspringen)",
                   style="Head.TLabel").pack(anchor="w")
-        self.lst_sec = tk.Listbox(f_sec, font=("Consolas", 10),
-                                  activestyle="none", bg=PANEL,
-                                  selectbackground=ACCENT,
-                                  selectforeground="white",
-                                  highlightthickness=0, bd=1,
-                                  relief="solid")
-        self.lst_sec.pack(fill="both", expand=True, pady=(4, 0))
-        self.lst_sec.bind("<<ListboxSelect>>", self._on_section_click)
+        sec_cols = ttk.Frame(f_sec, style="Panel.TFrame")
+        sec_cols.pack(fill="both", expand=True, pady=(4, 0))
+
+        colA = ttk.Frame(sec_cols, style="Panel.TFrame")
+        colA.pack(side="left", fill="both", expand=True, padx=(0, 3))
+        ttk.Label(colA, text="Schnitt A (automatisch)",
+                  style="Head.TLabel").pack(anchor="w")
+        self.lst_secA = tk.Listbox(colA, font=("Consolas", 9),
+                                   activestyle="none", bg=PANEL,
+                                   selectbackground=ACCENT,
+                                   selectforeground="white",
+                                   highlightthickness=0, bd=1,
+                                   relief="solid")
+        self.lst_secA.pack(fill="both", expand=True, pady=(2, 0))
+        self.lst_secA.bind("<<ListboxSelect>>", self._on_sectionA_click)
+
+        colB = ttk.Frame(sec_cols, style="Panel.TFrame")
+        colB.pack(side="left", fill="both", expand=True, padx=(3, 0))
+        ttk.Label(colB, text="Schnitt B (manuell)",
+                  style="Head.TLabel").pack(anchor="w")
+        self.lst_secB = tk.Listbox(colB, font=("Consolas", 9),
+                                   activestyle="none", bg=PANEL,
+                                   selectbackground="#e07000",
+                                   selectforeground="white",
+                                   highlightthickness=0, bd=1,
+                                   relief="solid")
+        self.lst_secB.pack(fill="both", expand=True, pady=(2, 0))
+        self.lst_secB.bind("<<ListboxSelect>>", self._on_sectionB_click)
+
+        rowB = ttk.Frame(f_sec, style="Panel.TFrame")
+        rowB.pack(fill="x", pady=(4, 0))
+        ttk.Label(rowB, text="Richtung B:").pack(side="left")
+        self.dir2_var = tk.StringVar(value="horizontal")
+        cb2 = ttk.Combobox(rowB, textvariable=self.dir2_var,
+                           values=["horizontal", "vertical"], width=10,
+                           state="readonly")
+        cb2.pack(side="left", padx=(4, 8))
+        cb2.bind("<<ComboboxSelected>>",
+                lambda e: self._rebuild_manual_section())
+        ttk.Button(rowB, text="✕ Entfernen",
+                   command=self._remove_selected_manual)\
+            .pack(side="left", padx=2)
+        ttk.Button(rowB, text="🗑 Schnitt B zurücksetzen",
+                   command=self._reset_manual_section)\
+            .pack(side="left", padx=2)
 
         f_txt = ttk.Frame(left, style="Panel.TFrame", padding=6)
         left.add(f_txt, weight=1)
@@ -259,11 +325,39 @@ class App(tk.Tk):
     def _on_press(self, ev):
         if self._toolbar_active():
             return
-        if ev.inaxes == self.ax and ev.button == 1 and ev.xdata is not None:
+        if ev.inaxes != self.ax or ev.xdata is None:
+            return
+        if ev.button == 3:                     # rechte Maustaste = Pan
             self.toolbar.push_current()        # fuer Vor/Zurueck
             self._pan_start = (ev.xdata, ev.ydata)
             self._labels_visible(False)        # fluessig verschieben
             self._last_motion = 0.0
+        elif ev.button == 1:                   # linke Maustaste = Bohrung waehlen
+            self._toggle_hole_at(ev.xdata, ev.ydata)
+
+    def _toggle_hole_at(self, x, y):
+        """Naechstgelegene axiale Bohrung unter dem Klick fuer den
+        manuellen Schnitt B an-/abwaehlen."""
+        if self.result is None:
+            return
+        best, bestd = None, None
+        for f in self.result["features"]:
+            if f.orientation != "axial":
+                continue
+            u, v = f.uv
+            d = math.hypot(u - x, v - y)
+            tol = max(f.diameter * 0.9, 3.0)
+            if d <= tol and (bestd is None or d < bestd):
+                best, bestd = f, d
+        if best is None:
+            return
+        idx = next((i for i, m in enumerate(self.manual_selection)
+                    if m is best), None)
+        if idx is None:
+            self.manual_selection.append(best)
+        else:
+            del self.manual_selection[idx]
+        self._rebuild_manual_section()
 
     def _on_motion(self, ev):
         if (self._pan_start is None or ev.inaxes != self.ax
@@ -313,6 +407,11 @@ class App(tk.Tk):
         self.step_path = path
         self.lbl_file.config(text=path.split("/")[-1].split("\\")[-1])
         self.thread_overrides.clear()
+        self.force_keys.clear()
+        self.skip_keys.clear()
+        self.hidden_keys.clear()
+        self.deleted_keys.clear()
+        self._delete_stack.clear()
         self.shape = None
         self.reanalyze()
 
@@ -323,6 +422,7 @@ class App(tk.Tk):
         if self._busy:
             return
         self._busy = True
+        self.manual_selection = []      # alte Feature-Objekte werden ungueltig
         self._q = queue.Queue()
         self._t0 = time.perf_counter()
         tm = dict(self.thread_map)
@@ -355,6 +455,7 @@ class App(tk.Tk):
                 elif kind == "done":
                     self._busy = False
                     self.geo = payload
+                    self.geo.setdefault("outline_cache", {})
                     self.refresh_view()
                     return
                 elif kind == "error":
@@ -386,6 +487,11 @@ class App(tk.Tk):
         q = queue.Queue()
         geo, view = self.geo, self.view_var.get()
         d, rot = self.dir_var.get(), self._rotation()
+
+        if self.deleted_keys:
+            geo = dict(self.geo)
+            geo["features"] = [f for f in self.geo["features"]
+                               if hd.type_key(f) not in self.deleted_keys]
 
         fk = frozenset(self.force_keys)
         sk = frozenset(self.skip_keys)
@@ -489,49 +595,19 @@ class App(tk.Tk):
     # ----------------------------------------------------------- Anzeige
     def _refresh(self):
         self._progress_off()
-        feats = self.result["features"]
-        rows = hd.table_rows(feats)
-
-        self.tree.delete(*self.tree.get_children())
-        by_no = {}
-        for f in feats:
-            by_no.setdefault(f.type_no, f)
-        for r in rows:
-            f = by_no.get(r["Nr"])
-            mark = ""
-            if f is not None:
-                k = hd.type_key(f)
-                if k in self.force_keys:
-                    mark = "⚑ "
-                elif k in self.skip_keys:
-                    mark = "∅ "
-            self.tree.insert("", "end",
-                             values=(r["Nr"], mark + str(r["Bezeichnung"]),
-                                     r["Durchmesser"], r["Art"],
-                                     r["Tiefe"], r["Anzahl"]))
-
-        self.lst_sec.delete(0, "end")
-        self._section_feats = list(self.result["section_hits"])
-        for f in self._section_feats:
-            ori = {"axial": "axial", "quer": "quer/längs"}.get(
-                f.orientation, f.orientation)
-            self.lst_sec.insert(
-                "end", f" {f.type_no:>2}  {f.label:<7} "
-                       f"{'durch' if f.through else 'Sack':<5} {ori}")
+        self._populate_tree()
+        self._compute_manual_section()
+        self._update_section_lists()
 
         self.txt.delete("1.0", "end")
         self.txt.insert("1.0", self.result["section_text"])
+        if self.manual_selection:
+            self.txt.insert("end", "\n\n" + self._manual_section_text())
 
-        self._hl_artist = None       # Achse wird geleert
-        self.ax.clear()
-        hr.draw_view(self.ax, self.result, self.view_var.get())
-        self.fig.tight_layout()
-        self.canvas.draw()
-        self._home_lims = (self.ax.get_xlim(), self.ax.get_ylim())
-        if hasattr(self.toolbar, "update"):
-            self.toolbar.update()    # Ansichts-Historie zuruecksetzen
-        self.toolbar.push_current()
+        self._draw(reset_view=True)
 
+        feats = self.result["features"]
+        rows = hd.table_rows(feats)
         n = len(feats)
         n_ax = sum(1 for f in feats if f.orientation == "axial")
         n_q = n - n_ax
@@ -541,6 +617,59 @@ class App(tk.Tk):
             text=f"✔ {n} Formelemente ({len(rows)} Typen) — {n_ax} axial, "
                  f"{n_q} quer/schräg — {nseg} Rohsegmente — "
                  f"Erkennung v{hd.__version__}")
+
+    def _populate_tree(self):
+        """Bohrtabelle (links) neu befuellen, inkl. Markierungen und
+        Sichtbarkeits-Icon."""
+        feats = self.result["features"]
+        rows = hd.table_rows(feats)
+        self.tree.delete(*self.tree.get_children())
+        by_no = {}
+        for f in feats:
+            by_no.setdefault(f.type_no, f)
+        self._by_no = by_no
+        for r in rows:
+            f = by_no.get(r["Nr"])
+            mark = ""
+            eye = "👁"
+            if f is not None:
+                k = hd.type_key(f)
+                if k in self.force_keys:
+                    mark = "⚑ "
+                elif k in self.skip_keys:
+                    mark = "∅ "
+                if k in self.hidden_keys:
+                    eye = "🚫"
+            self.tree.insert("", "end",
+                             values=(r["Nr"], mark + str(r["Bezeichnung"]),
+                                     r["Durchmesser"], r["Art"],
+                                     r["Tiefe"], r["Anzahl"], eye))
+
+    def _draw(self, reset_view=True):
+        """Grafik (neu) zeichnen. Bei reset_view=False bleiben Zoom/Pan
+        erhalten (fuer leichte Aktualisierungen wie Sichtbarkeits-Umschalten
+        oder Schnitt-B-Aenderungen)."""
+        if self.result is None:
+            return
+        xlim = ylim = None
+        if not reset_view:
+            xlim, ylim = self.ax.get_xlim(), self.ax.get_ylim()
+        self._hl_artist = None       # Achse wird geleert
+        self.ax.clear()
+        hidden_now = {f.type_no for f in self.result["features"]
+                      if hd.type_key(f) in self.hidden_keys}
+        hr.draw_view(self.ax, self.result, self.view_var.get(),
+                    hidden_types=hidden_now)
+        self.fig.tight_layout()
+        if xlim is not None:
+            self.ax.set_xlim(xlim)
+            self.ax.set_ylim(ylim)
+        self.canvas.draw()
+        if reset_view:
+            self._home_lims = (self.ax.get_xlim(), self.ax.get_ylim())
+            if hasattr(self.toolbar, "update"):
+                self.toolbar.update()    # Ansichts-Historie zuruecksetzen
+            self.toolbar.push_current()
 
     def _mark_type(self, kind):
         """Ausgewaehlten Typ erzwingen / als nicht noetig markieren
@@ -568,11 +697,148 @@ class App(tk.Tk):
                 self.force_keys.discard(key)
         self.refresh_view()
 
+    # ------------------------------------------------ Sichtbarkeit (Augen)
+    def _on_tree_button1(self, ev):
+        region = self.tree.identify("region", ev.x, ev.y)
+        if region != "cell":
+            return
+        col = self.tree.identify_column(ev.x)
+        row = self.tree.identify_row(ev.y)
+        if not row or col != self._eye_col_id:
+            return
+        tno = int(self.tree.item(row)["values"][0])
+        self._toggle_row_visibility(tno)
+        return "break"
+
+    def _toggle_row_visibility(self, tno):
+        f = self._by_no.get(tno) if hasattr(self, "_by_no") else None
+        if f is None or self.result is None:
+            return
+        key = hd.type_key(f)
+        if key in self.hidden_keys:
+            self.hidden_keys.discard(key)
+        else:
+            self.hidden_keys.add(key)
+        self._populate_tree()
+        self._draw(reset_view=False)
+
+    def _toggle_all_labels(self):
+        if self.result is None:
+            return
+        keys = {hd.type_key(f) for f in self.result["features"]}
+        if self.hidden_keys & keys:
+            self.hidden_keys -= keys
+        else:
+            self.hidden_keys |= keys
+        self._populate_tree()
+        self._draw(reset_view=False)
+
+    # ------------------------------------------------- Bohrung loeschen
+    def _delete_selected_type(self):
+        sel = self.tree.selection()
+        if not sel or self.result is None:
+            return
+        tno = int(self.tree.item(sel[0])["values"][0])
+        f = next((x for x in self.result["features"]
+                  if x.type_no == tno), None)
+        if f is None:
+            return
+        if not messagebox.askyesno(
+                "Bohrung löschen",
+                f"Typ {tno} ({f.label}, {hd._fmt(f.diameter)} mm) wirklich "
+                "aus der Bohrtabelle löschen?\n\nMit '↺ Löschung "
+                "rückgängig' wiederherstellbar."):
+            return
+        key = hd.type_key(f)
+        self.deleted_keys.add(key)
+        self._delete_stack.append(key)
+        self.manual_selection = [m for m in self.manual_selection
+                                 if hd.type_key(m) != key]
+        self.refresh_view()
+
+    def _undo_delete(self):
+        if not self._delete_stack:
+            return
+        key = self._delete_stack.pop()
+        self.deleted_keys.discard(key)
+        self.refresh_view()
+
+    # ------------------------------------------------- Schnitt B (manuell)
+    def _compute_manual_section(self):
+        if self.result is None:
+            return
+        live_ids = {id(f) for f in self.result["features"]}
+        self.manual_selection = [f for f in self.manual_selection
+                                 if id(f) in live_ids]
+        poly2, hits2 = hd.plan_manual_section(
+            self.manual_selection, self.result["features"],
+            direction=self.dir2_var.get())
+        self.result["section2_poly"] = poly2
+        self.result["section2_hits"] = hits2
+
+    def _rebuild_manual_section(self):
+        if self.result is None:
+            return
+        self._compute_manual_section()
+        self._update_section_lists()
+        self._draw(reset_view=False)
+
+    def _remove_selected_manual(self):
+        sel = self.lst_secB.curselection()
+        if not sel or self.result is None:
+            return
+        hits2 = self.result.get("section2_hits") or []
+        if sel[0] < len(hits2):
+            target = hits2[sel[0]]
+            self.manual_selection = [m for m in self.manual_selection
+                                     if m is not target]
+            self._rebuild_manual_section()
+
+    def _reset_manual_section(self):
+        self.manual_selection = []
+        self._rebuild_manual_section()
+
+    def _manual_section_text(self):
+        poly2 = self.result.get("section2_poly") or []
+        hits2 = self.result.get("section2_hits") or []
+        if not poly2:
+            return "Schnitt B-B (manuell): keine Bohrung ausgewählt."
+        lines = [f"Stufenschnitt B-B (manuell), Richtung: "
+                f"{self.dir2_var.get()}"]
+        for i, (u, v) in enumerate(poly2):
+            lines.append(f"  P{i+1}: ({u:.1f}, {v:.1f})")
+        tags = ", ".join(f"#{f.type_no}" for f in hits2)
+        lines.append(f"Geschnittene Bohrungen: {tags or '—'}  "
+                     f"({len(hits2)} Bohrungen)")
+        return "\n".join(lines)
+
+    def _update_section_lists(self):
+        self.lst_secA.delete(0, "end")
+        self._section_feats = list(self.result.get("section_hits", []))
+        for f in self._section_feats:
+            ori = {"axial": "axial", "quer": "quer/längs"}.get(
+                f.orientation, f.orientation)
+            self.lst_secA.insert(
+                "end", f" {f.type_no:>2}  {f.label:<7} "
+                       f"{'durch' if f.through else 'Sack':<5} {ori}")
+
+        self.lst_secB.delete(0, "end")
+        self._section2_feats = list(self.result.get("section2_hits", []))
+        for f in self._section2_feats:
+            self.lst_secB.insert(
+                "end", f" {f.type_no:>2}  {f.label:<7} "
+                       f"{'durch' if f.through else 'Sack':<5} axial")
+
     # ------------------------------------------------- Navigation/Fokus
-    def _on_section_click(self, _ev):
-        sel = self.lst_sec.curselection()
+    def _on_sectionA_click(self, _ev):
+        sel = self.lst_secA.curselection()
         if sel and sel[0] < len(self._section_feats):
             self._goto_feature(self._section_feats[sel[0]])
+
+    def _on_sectionB_click(self, _ev):
+        sel = self.lst_secB.curselection()
+        if sel and sel[0] < len(self._section2_feats):
+            self._goto_feature(self._section2_feats[sel[0]])
 
     def _on_tree_click(self, _ev):
         sel = self.tree.selection()
