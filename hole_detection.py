@@ -151,6 +151,8 @@ class Feature:
     type_no: int = 0             # gleiche Formelemente = gleiche Nummer
     orientation: str = "axial"   # 'axial' | 'quer' | 'schraeg' (bzgl. Ansicht)
     uv: tuple = (0.0, 0.0)       # Bildkoordinaten in der Ansicht
+    uid: int = -1                # stabile Instanz-ID (ueber alle Ansichten
+                                 # und Neunummerierungen hinweg gleich)
 
 
 # ----------------------------------------------------------------------------
@@ -1525,6 +1527,8 @@ def analyze_geometry(shape_or_path, thread_map=None,
     holes = filter_fillets(holes)
     feats = build_features(shape, holes, cones, thread_map,
                            thread_requires_chamfer, tester=tester)
+    for i, f in enumerate(feats):
+        f.uid = i                # ueberlebt Ansichtswechsel/Neunummerierung
     feats = assign_type_numbers(feats)
     return {
         "shape": shape,
@@ -1708,6 +1712,29 @@ def build_section_text(features, poly, hits, view, direction, warn=False,
                    + ", ".join(str(m) for m in miss))
     if warn:
         txt.append("WARNUNG: Konflikt nicht vollstaendig aufloesbar.")
+    return "\n".join(txt)
+
+
+def build_manual_section_text(features, poly, hits, view, direction,
+                              rotation=0):
+    """Textausgabe fuer den manuell (per Linksklick auf die Bohrungen)
+    erstellten Schnitt: keine Erreichbarkeits-/Konfliktpruefung, nur
+    Auflistung in der vom Anwender gewaehlten Reihenfolge."""
+    if not poly:
+        return ("Manueller Schnitt: keine Bohrung ausgewaehlt.\n"
+                "Linksklick auf eine Bohrung in der Grafik nimmt sie in "
+                "den Schnitt auf (erneuter Klick entfernt sie wieder).")
+    horiz = (direction == "horizontal")
+    dname = ("horizontal (links -> rechts)" if horiz
+             else "vertikal (unten -> oben)")
+    txt = [f"Manueller Stufenschnitt A-A, Richtung: {dname}",
+           "Verlauf (u=Bild-x, v=Bild-y), in Auswahlreihenfolge:"]
+    for i, (u, v) in enumerate(poly):
+        txt.append(f"  P{i+1}: ({u:.1f}, {v:.1f})")
+    tags = [f"#{f.type_no} (quer)" if f.orientation == "quer"
+            else f"#{f.type_no}" for f in hits]
+    txt.append("Ausgewaehlte Bohrungen in Auswahlreihenfolge: "
+               + ", ".join(tags) + f"  ({len(hits)} Bohrungen)")
     return "\n".join(txt)
 
 

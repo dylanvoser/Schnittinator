@@ -20,6 +20,7 @@ COL_AXIAL = "#1a1a1a"
 COL_THREAD = "#0057b8"
 COL_CROSS = "#b30000"
 COL_SECTION = "#7a00a8"
+COL_MANUAL = "#e07b00"
 
 
 def outline_uv(shape, view):
@@ -61,7 +62,12 @@ def draw_coord_cross(ax, view, u0, v0, rotation=0):
                 fontweight="bold", ha="center")
 
 
-def draw_view(ax, result, view, show_section=True):
+def draw_view(ax, result, view, show_section=True,
+             hidden_label_uids=frozenset(), manual_marks=None, manual=False):
+    """hidden_label_uids: Bohrungs-uids, deren Nummer NICHT gezeichnet wird.
+    manual_marks: {uid: Auswahlreihenfolge (1..n)} der im manuellen
+    Schnitt-Modus per Klick ausgewaehlten Bohrungen -> werden farbig
+    hervorgehoben und zusaetzlich mit ihrer Auswahlnummer beschriftet."""
     import math as _m
     import numpy as _np
     from matplotlib.collections import LineCollection
@@ -70,6 +76,7 @@ def draw_view(ax, result, view, show_section=True):
     feats = result["features"]
     poly = result.get("section_poly", [])
     rot = result.get("rotation", 0)
+    manual_marks = manual_marks or {}
 
     u0, v0, u1, v1 = result.get("bounds") or outline_uv(shape, view)
 
@@ -97,6 +104,7 @@ def draw_view(ax, result, view, show_section=True):
     labels = []   # (x, y, text, color)
     for f in feats:
         u, v = f.uv
+        marked = f.uid in manual_marks
         if f.orientation == "axial":
             r = f.diameter / 2.0
             if f.kind == "Gewinde":
@@ -113,10 +121,17 @@ def draw_view(ax, result, view, show_section=True):
                 if f.kind == "Kegelsenkung":
                     add(circle(u, v, r*1.8), COL_AXIAL, 0.7, "dotted")
                 lab_col = COL_AXIAL
+            if marked:
+                add(circle(u, v, r*1.4 + 1.0), COL_MANUAL, 2.0)
             m = max(r*1.4, 3.0)
             add([(u-m, v), (u+m, v)], "#888888", 0.5, (0, (8, 2, 1, 2)))
             add([(u, v-m), (u, v+m)], "#888888", 0.5, (0, (8, 2, 1, 2)))
-            labels.append((u + m*0.75, v + m*0.75, str(f.type_no), lab_col))
+            if f.uid not in hidden_label_uids:
+                labels.append((u + m*0.75, v + m*0.75, str(f.type_no),
+                               lab_col))
+            if marked:
+                labels.append((u - m*0.9, v - m*0.9,
+                               str(manual_marks[f.uid]), COL_MANUAL))
         else:
             a, b = feature_uv_extent(f, view, rot)
             du, dv = b[0]-a[0], b[1]-a[1]
@@ -130,8 +145,18 @@ def draw_view(ax, result, view, show_section=True):
                  (a[0]+nu*r, a[1]+nv*r)], COL_CROSS, 1.2, "dashed")
             add([(a[0], a[1]), (b[0], b[1])], COL_CROSS, 0.7,
                 (0, (10, 3, 1, 3)))
+            if marked:
+                r2 = r + 1.2
+                add([(a[0]+nu*r2, a[1]+nv*r2), (b[0]+nu*r2, b[1]+nv*r2),
+                     (b[0]-nu*r2, b[1]-nv*r2), (a[0]-nu*r2, a[1]-nv*r2),
+                     (a[0]+nu*r2, a[1]+nv*r2)], COL_MANUAL, 2.0)
             mu, mv = (a[0]+b[0])/2, (a[1]+b[1])/2
-            labels.append((mu + 3, mv + r + 2, str(f.type_no), COL_CROSS))
+            if f.uid not in hidden_label_uids:
+                labels.append((mu + 3, mv + r + 2, str(f.type_no),
+                               COL_CROSS))
+            if marked:
+                labels.append((mu + 3, mv - r - 6,
+                               str(manual_marks[f.uid]), COL_MANUAL))
 
     for (color, lw, ls), segs in buckets.items():
         ax.add_collection(LineCollection(segs, colors=color, linewidths=lw,
@@ -145,15 +170,16 @@ def draw_view(ax, result, view, show_section=True):
         ys = [p[1] for p in poly]
         ax.plot(xs, ys, color=COL_SECTION, lw=1.8, ls=(0, (12, 3, 2, 3)),
                 alpha=0.9, zorder=4)
-        for (px, py), (qx, qy), lab in ((poly[0], poly[1], "A"),
-                                        (poly[-1], poly[-2], "A")):
-            dx, dy = qx-px, qy-py
-            n = _m.hypot(dx, dy) or 1.0
-            ax.annotate(lab, (px, py), (px - 5*dy/n, py + 5*dx/n),
-                        fontsize=11, color=COL_SECTION, fontweight="bold")
-            ax.add_patch(FancyArrow(px, py, -4*dy/n, 4*dx/n, width=0.3,
-                                    head_width=2.2, head_length=2.2,
-                                    color=COL_SECTION))
+        if len(poly) >= 2:
+            for (px, py), (qx, qy), lab in ((poly[0], poly[1], "A"),
+                                            (poly[-1], poly[-2], "A")):
+                dx, dy = qx-px, qy-py
+                n = _m.hypot(dx, dy) or 1.0
+                ax.annotate(lab, (px, py), (px - 5*dy/n, py + 5*dx/n),
+                            fontsize=11, color=COL_SECTION, fontweight="bold")
+                ax.add_patch(FancyArrow(px, py, -4*dy/n, 4*dx/n, width=0.3,
+                                        head_width=2.2, head_length=2.2,
+                                        color=COL_SECTION))
 
     draw_coord_cross(ax, view, u0, v0, rot)
 
@@ -164,11 +190,17 @@ def draw_view(ax, result, view, show_section=True):
     ax.set_ylabel("v [mm]")
     dname = result.get("direction", "horizontal")
     rtxt = f", {rot}° gedreht" if rot else ""
-    ax.set_title(f"Ansicht: {view}{rtxt}  —  Stufenschnitt A-A ({dname})")
+    schnitt_lbl = "Manueller Schnitt A-A" if manual else "Stufenschnitt A-A"
+    ax.set_title(f"Ansicht: {view}{rtxt}  —  {schnitt_lbl} ({dname})")
     handles = [
         Line2D([], [], color=COL_AXIAL, lw=1.4, label="Bohrung (axial)"),
         Line2D([], [], color=COL_THREAD, lw=1.4, label="Gewinde"),
         Line2D([], [], color=COL_CROSS, lw=1.2, ls="--", label="Querbohrung"),
-        Line2D([], [], color=COL_SECTION, lw=1.8, ls="-.", label="Schnitt A-A"),
+        Line2D([], [], color=COL_SECTION, lw=1.8, ls="-.",
+               label=schnitt_lbl),
     ]
+    if manual_marks:
+        handles.append(Line2D([], [], marker="o", color=COL_MANUAL, lw=0,
+                              markerfacecolor="none", markeredgewidth=2,
+                              label="Manuell ausgewählt"))
     ax.legend(handles=handles, loc="upper right", fontsize=7, framealpha=0.9)
