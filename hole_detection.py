@@ -1494,6 +1494,105 @@ def plan_step_section(features, view="top", direction="horizontal",
 
 
 # ----------------------------------------------------------------------------
+# Manueller Zweitschnitt (Schnitt B-B): Versatzschnitt durch eine vom
+# Anwender per Klick gewaehlte Menge von Bohrungen, in der Reihenfolge ihrer
+# Lage entlang der Schnittrichtung. Im Gegensatz zum automatischen
+# Stufenschnitt wird hier keine Optimalitaet gesucht, sondern nur versucht,
+# die Knicke (Spruenge zwischen den Ebenen) so zu legen, dass sie andere,
+# NICHT ausgewaehlte axiale Bohrungen nach Moeglichkeit nicht kreuzen.
+# ----------------------------------------------------------------------------
+def plan_manual_section(selected, all_features, direction="horizontal",
+                        margin=2.0, cluster_tol=1.0):
+    """Versatzschnitt B-B durch die angeklickten (axialen) Bohrungen.
+
+    selected      : Liste von Feature-Objekten in Klickreihenfolge (die
+                     tatsaechliche Ausgabereihenfolge richtet sich nach der
+                     Lage entlang der Schnittrichtung, nicht nach der
+                     Klickreihenfolge).
+    all_features  : alle Features der aktuellen Ansicht (fuer die
+                     Kollisionspruefung der Sprungsegmente).
+    Rueckgabe: (poly, hits) — poly = Liste (u,v)-Punkte, hits = geschnittene
+    Features in Schnittreihenfolge. ([], []) wenn keine axiale Bohrung
+    ausgewaehlt ist.
+    """
+    horiz = (direction == "horizontal")
+
+    def to_st(p):
+        return (p[0], p[1]) if horiz else (p[1], p[0])
+
+    pts = []
+    for f in selected:
+        if f.orientation != "axial":
+            continue
+        s, t = to_st(f.uv)
+        pts.append((s, t, f))
+    if not pts:
+        return [], []
+    pts.sort(key=lambda x: x[0])
+
+    # in Ebenen-Gruppen (annaehernd gleiches t) zusammenfassen
+    groups = []
+    for s, t, f in pts:
+        if groups and abs(t - groups[-1][0]) <= cluster_tol:
+            groups[-1][1].append((s, f))
+        else:
+            groups.append((t, [(s, f)]))
+
+    sel_ids = set(id(f) for f in selected)
+    blockers = [(( f.uv[0] if horiz else f.uv[1]),
+                 (f.uv[1] if horiz else f.uv[0]), f.diameter / 2.0)
+                for f in all_features
+                if f.orientation == "axial" and id(f) not in sel_ids]
+
+    def jog_free(s, tlo, thi):
+        for bs, bt, br in blockers:
+            if (tlo - br - margin * 0.4 < bt < thi + br + margin * 0.4
+                    and abs(bs - s) < br + margin * 0.4):
+                return False
+        return True
+
+    def find_jog(lo, hi, tlo, thi, prefer):
+        if hi < lo:
+            lo, hi = hi, lo
+        cand = [prefer, lo, hi, 0.5 * (lo + hi)]
+        if hi > lo:
+            step = max((hi - lo) / 10.0, 0.5)
+            c = lo
+            while c <= hi:
+                cand.append(c)
+                c += step
+        for c in cand:
+            c = min(max(c, lo), hi)
+            if jog_free(c, tlo, thi):
+                return c
+        return prefer   # kein freier Punkt gefunden -> bestmoegliche Naeherung
+
+    lead = 5.0
+    all_s = [s for _, mem in groups for s, _ in mem]
+    smin_all, smax_all = min(all_s) - lead, max(all_s) + lead
+
+    poly = [(smin_all, groups[0][0])]
+    prev_s = smin_all
+    for gi in range(len(groups) - 1):
+        t_a, mem_a = groups[gi]
+        t_b, mem_b = groups[gi + 1]
+        s_a_max = max(s for s, _ in mem_a)
+        s_b_min = min(s for s, _ in mem_b)
+        lo = max(s_a_max + margin, prev_s + margin)
+        hi = max(s_b_min - margin, lo)
+        prefer = 0.5 * (lo + hi)
+        s_jog = find_jog(lo, hi, min(t_a, t_b), max(t_a, t_b), prefer)
+        poly.append((s_jog, t_a))
+        poly.append((s_jog, t_b))
+        prev_s = s_jog
+    poly.append((smax_all, groups[-1][0]))
+
+    ordered = [f for _, mem in groups for _, f in mem]
+    poly_uv = poly if horiz else [(t, s) for (s, t) in poly]
+    return poly_uv, ordered
+
+
+# ----------------------------------------------------------------------------
 # Komplettpipeline — getrennt in schwere Geometriephase (einmal je Datei /
 # Gewinde-Einstellung, wird gecacht) und leichte Ansichtsphase (bei jedem
 # Ansichts-/Richtungswechsel).
