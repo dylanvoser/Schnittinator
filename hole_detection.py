@@ -1660,22 +1660,41 @@ def analyze_geometry(shape_or_path, thread_map=None,
 def analyze_view(geo, view="top", direction="horizontal", rotation=0,
                  force_keys=frozenset(), skip_keys=frozenset(),
                  manual_selection=(), manual_direction="horizontal",
-                 renumber_source="A"):
+                 renumber_source="A", section_cache=None):
     """LEICHTE Phase: Orientierung/Projektion (inkl. Bilddrehung),
     Stufenschnitt, manueller Zweitschnitt B-B, Nummerierung entlang des
     gewaehlten Schnitts (renumber_source 'A' oder 'B'), Text, Aussenkontur.
-    manual_selection: Feature-Objekte aus geo['features'] fuer Schnitt B."""
+    manual_selection: Feature-Objekte aus geo['features'] fuer Schnitt B.
+    section_cache: optionales, vom Aufrufer gehaltenes dict — der teure
+    Stufenschnitt A-A (doppelte Planung mit/ohne Spiegelung) wird darin
+    zwischengespeichert und bei unveraenderten Eingaben (Ansicht, Richtung,
+    Drehung, Erzwingen-/Nicht-noetig-Markierungen, Bohrungsmenge)
+    wiederverwendet — wichtig, damit Schnitt-B-Aenderungen (Klick fuer
+    manuelle Bohrungsauswahl) nicht jedes Mal die komplette, aufwendige
+    Stufenschnitt-Optimierung neu durchlaufen."""
     feats = assign_type_numbers(geo["features"])
     feats = classify_view(feats, view, rotation)
     bnds = bounds_uv(geo["shape"], view, rotation)
-    best = None
-    for mir in (False, True):
-        poly_, hits_, raw_, sc_, soft_ = plan_step_section(
-            feats, view, direction, bounds=bnds, rotation=rotation,
-            _mirror=mir, force_keys=force_keys, skip_keys=skip_keys)
-        if best is None or sc_ > best[3]:
-            best = (poly_, hits_, raw_, sc_, soft_)
-    poly, hits, raw_txt, _, soft_sum = best
+
+    cache_key = (view, direction, int(rotation) % 360,
+                frozenset(force_keys), frozenset(skip_keys),
+                tuple(id(f) for f in feats))
+    cached = section_cache.get(cache_key) if section_cache is not None \
+        else None
+    if cached is not None:
+        poly, hits, raw_txt, soft_sum = cached
+    else:
+        best = None
+        for mir in (False, True):
+            poly_, hits_, raw_, sc_, soft_ = plan_step_section(
+                feats, view, direction, bounds=bnds, rotation=rotation,
+                _mirror=mir, force_keys=force_keys, skip_keys=skip_keys)
+            if best is None or sc_ > best[3]:
+                best = (poly_, hits_, raw_, sc_, soft_)
+        poly, hits, raw_txt, _, soft_sum = best
+        if section_cache is not None:
+            section_cache.clear()   # nur die aktuelle Ansicht vorhalten
+            section_cache[cache_key] = (poly, hits, raw_txt, soft_sum)
 
     poly2, hits2 = plan_manual_section(
         list(manual_selection), feats, view=view,

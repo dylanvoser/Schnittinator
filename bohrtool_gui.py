@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-bohrtool_gui.py — Bohrungserkennung aus STEP (GUI, v2.6)
+bohrtool_gui.py — Schnittinator: Bohrungserkennung aus STEP (GUI, v2.6)
 
 Start:  python bohrtool_gui.py
 
@@ -15,6 +15,7 @@ Bohrtabelle: 👁-Spalte blendet einzelne Bohrnummern aus/ein, Kopf-Knopf alle.
 """
 import csv
 import math
+import os
 import threading
 import queue
 import time
@@ -51,9 +52,10 @@ class NavToolbar(NavigationToolbar2Tk):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Bohrungserkennung aus STEP")
+        self.title("Schnittinator")
         self.geometry("1500x900")
         self.configure(bg=BG)
+        self._set_icon()
         self._setup_style()
 
         self.shape = None
@@ -68,6 +70,7 @@ class App(tk.Tk):
         self.deleted_keys = set()
         self._delete_stack = []
         self.manual_selection = []       # Feature-Objekte fuer Schnitt B
+        self._section_cache = {}         # teurer Stufenschnitt A-A, s. hd.analyze_view
         self._section_feats = []
         self._hl_artist = None
         self._pan_start = None
@@ -76,6 +79,18 @@ class App(tk.Tk):
         self._busy = False
 
         self._build_ui()
+
+    # --------------------------------------------------------------- Icon
+    def _set_icon(self):
+        base = os.path.dirname(os.path.abspath(__file__))
+        try:
+            icons = [tk.PhotoImage(file=os.path.join(base, "assets", n))
+                    for n in ("icon_128.png", "icon_64.png", "icon_32.png",
+                              "icon_16.png")]
+            self._icon_imgs = icons     # Referenz halten (sonst GC'd)
+            self.iconphoto(True, *icons)
+        except Exception:
+            pass                        # z.B. Bilder fehlen -> Standardicon
 
     # ---------------------------------------------------------------- Stil
     def _setup_style(self):
@@ -246,7 +261,7 @@ class App(tk.Tk):
                            state="readonly")
         cb2.pack(side="left", padx=(4, 8))
         cb2.bind("<<ComboboxSelected>>",
-                lambda e: self.refresh_view(reset_view=False))
+                lambda e: self._quick_refresh())
         ttk.Button(rowB, text="✕ Entfernen",
                    command=self._remove_selected_manual)\
             .pack(side="left", padx=2)
@@ -263,7 +278,7 @@ class App(tk.Tk):
                            state="readonly")
         cbN.pack(side="left", padx=(4, 0))
         cbN.bind("<<ComboboxSelected>>",
-                lambda e: self.refresh_view(reset_view=False))
+                lambda e: self._quick_refresh())
 
         f_txt = ttk.Frame(left, style="Panel.TFrame", padding=6)
         left.add(f_txt, weight=1)
@@ -382,7 +397,7 @@ class App(tk.Tk):
             self.manual_selection.append(best)
         else:
             del self.manual_selection[idx]
-        self.refresh_view(reset_view=False)
+        self._quick_refresh()
 
     def _on_motion(self, ev):
         if (self._pan_start is None or ev.inaxes != self.ax
@@ -448,6 +463,7 @@ class App(tk.Tk):
             return
         self._busy = True
         self.manual_selection = []      # alte Feature-Objekte werden ungueltig
+        self._section_cache = {}        # bezog sich auf die alten Objekte
         self._q = queue.Queue()
         self._t0 = time.perf_counter()
         tm = dict(self.thread_map)
@@ -503,34 +519,36 @@ class App(tk.Tk):
         self.progress.stop()
         self.progress.pack_forget()
 
+    def _analyze_kwargs(self):
+        """Gemeinsame Eingaben fuer hd.analyze_view (Hintergrund- und
+        Schnellpfad)."""
+        self._apply_overrides()
+        geo, view = self.geo, self.view_var.get()
+        d, rot = self.dir_var.get(), self._rotation()
+        if self.deleted_keys:
+            geo = dict(self.geo)
+            geo["features"] = [f for f in self.geo["features"]
+                               if hd.type_key(f) not in self.deleted_keys]
+        renum = "B" if self.renumber_var.get() == "Schnitt B" else "A"
+        return dict(geo=geo, view=view, direction=d, rotation=rot,
+                   force_keys=frozenset(self.force_keys),
+                   skip_keys=frozenset(self.skip_keys),
+                   manual_selection=list(self.manual_selection),
+                   manual_direction=self.dir2_var.get(),
+                   renumber_source=renum, section_cache=self._section_cache)
+
     def refresh_view(self, reset_view=True):
         """Ansichtsphase (Schnittplanung) im Hintergrund mit Ladebalken.
         reset_view=False erhaelt Zoom/Pan (z.B. bei Schnitt-B-Klicks)."""
         if self.geo is None or getattr(self, "_busy_view", False):
             return
         self._busy_view = True
-        self._apply_overrides()
+        kwargs = self._analyze_kwargs()
         q = queue.Queue()
-        geo, view = self.geo, self.view_var.get()
-        d, rot = self.dir_var.get(), self._rotation()
-
-        if self.deleted_keys:
-            geo = dict(self.geo)
-            geo["features"] = [f for f in self.geo["features"]
-                               if hd.type_key(f) not in self.deleted_keys]
-
-        fk = frozenset(self.force_keys)
-        sk = frozenset(self.skip_keys)
-        manual_sel = list(self.manual_selection)
-        d2 = self.dir2_var.get()
-        renum = "B" if self.renumber_var.get() == "Schnitt B" else "A"
 
         def worker():
             try:
-                q.put(("ok", hd.analyze_view(
-                    geo, view, d, rotation=rot, force_keys=fk, skip_keys=sk,
-                    manual_selection=manual_sel, manual_direction=d2,
-                    renumber_source=renum)))
+                q.put(("ok", hd.analyze_view(**kwargs)))
             except Exception as e:
                 q.put(("error", e))
 
@@ -557,6 +575,26 @@ class App(tk.Tk):
                 messagebox.showerror("Analysefehler", str(payload))
 
         poll()
+
+    def _quick_refresh(self, reset_view=False):
+        """Synchrone Aktualisierung ohne Hintergrund-Thread, fuer Schnitt-B-
+        Aenderungen (Klick, Entfernen, Zuruecksetzen, Richtung/Nummerierung):
+        dank Schnitt-A-Cache in hd.analyze_view ist das i.d.R. sofort fertig.
+        Faellt auf den Hintergrundpfad zurueck, wenn dieser gerade laeuft
+        (verhindert gleichzeitigen Zugriff auf Cache/Feature-Objekte)."""
+        if self.geo is None:
+            return
+        if getattr(self, "_busy_view", False):
+            self.refresh_view(reset_view=reset_view)
+            return
+        kwargs = self._analyze_kwargs()
+        try:
+            self.result = hd.analyze_view(**kwargs)
+        except Exception as e:
+            self.lbl_status.config(text="Fehler.")
+            messagebox.showerror("Analysefehler", str(e))
+            return
+        self._refresh(reset_view=reset_view)
 
     # ----------------------------------------------- Gewinde-Umschaltung
     def _apply_overrides(self):
@@ -803,11 +841,11 @@ class App(tk.Tk):
             target = hits2[sel[0]]
             self.manual_selection = [m for m in self.manual_selection
                                      if m is not target]
-            self.refresh_view(reset_view=False)
+            self._quick_refresh()
 
     def _reset_manual_section(self):
         self.manual_selection = []
-        self.refresh_view(reset_view=False)
+        self._quick_refresh()
 
     def _manual_section_text(self):
         poly2 = self.result.get("section2_poly") or []
