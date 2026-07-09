@@ -246,13 +246,24 @@ class App(tk.Tk):
                            state="readonly")
         cb2.pack(side="left", padx=(4, 8))
         cb2.bind("<<ComboboxSelected>>",
-                lambda e: self._rebuild_manual_section())
+                lambda e: self.refresh_view(reset_view=False))
         ttk.Button(rowB, text="✕ Entfernen",
                    command=self._remove_selected_manual)\
             .pack(side="left", padx=2)
         ttk.Button(rowB, text="🗑 Schnitt B zurücksetzen",
                    command=self._reset_manual_section)\
             .pack(side="left", padx=2)
+
+        rowN = ttk.Frame(f_sec, style="Panel.TFrame")
+        rowN.pack(fill="x", pady=(4, 0))
+        ttk.Label(rowN, text="Nummerierung nach:").pack(side="left")
+        self.renumber_var = tk.StringVar(value="Schnitt A")
+        cbN = ttk.Combobox(rowN, textvariable=self.renumber_var,
+                           values=["Schnitt A", "Schnitt B"], width=10,
+                           state="readonly")
+        cbN.pack(side="left", padx=(4, 0))
+        cbN.bind("<<ComboboxSelected>>",
+                lambda e: self.refresh_view(reset_view=False))
 
         f_txt = ttk.Frame(left, style="Panel.TFrame", padding=6)
         left.add(f_txt, weight=1)
@@ -335,17 +346,31 @@ class App(tk.Tk):
         elif ev.button == 1:                   # linke Maustaste = Bohrung waehlen
             self._toggle_hole_at(ev.xdata, ev.ydata)
 
+    @staticmethod
+    def _point_seg_dist(px, py, ax_, ay_, bx, by):
+        dx, dy = bx - ax_, by - ay_
+        ln2 = dx*dx + dy*dy
+        if ln2 < 1e-9:
+            return math.hypot(px - ax_, py - ay_)
+        t = max(0.0, min(1.0, ((px-ax_)*dx + (py-ay_)*dy) / ln2))
+        return math.hypot(px - (ax_ + t*dx), py - (ay_ + t*dy))
+
     def _toggle_hole_at(self, x, y):
-        """Naechstgelegene axiale Bohrung unter dem Klick fuer den
-        manuellen Schnitt B an-/abwaehlen."""
+        """Naechstgelegene Bohrung (axial ODER quer) unter dem Klick fuer
+        den manuellen Schnitt B an-/abwaehlen."""
         if self.result is None:
             return
+        view, rot = self.view_var.get(), self._rotation()
         best, bestd = None, None
         for f in self.result["features"]:
-            if f.orientation != "axial":
+            if f.orientation == "axial":
+                u, v = f.uv
+                d = math.hypot(u - x, v - y)
+            elif f.orientation in ("quer", "schraeg"):
+                a, b = hd.feature_uv_extent(f, view, rot)
+                d = self._point_seg_dist(x, y, a[0], a[1], b[0], b[1])
+            else:
                 continue
-            u, v = f.uv
-            d = math.hypot(u - x, v - y)
             tol = max(f.diameter * 0.9, 3.0)
             if d <= tol and (bestd is None or d < bestd):
                 best, bestd = f, d
@@ -357,7 +382,7 @@ class App(tk.Tk):
             self.manual_selection.append(best)
         else:
             del self.manual_selection[idx]
-        self._rebuild_manual_section()
+        self.refresh_view(reset_view=False)
 
     def _on_motion(self, ev):
         if (self._pan_start is None or ev.inaxes != self.ax
@@ -478,8 +503,9 @@ class App(tk.Tk):
         self.progress.stop()
         self.progress.pack_forget()
 
-    def refresh_view(self):
-        """Ansichtsphase (Schnittplanung) im Hintergrund mit Ladebalken."""
+    def refresh_view(self, reset_view=True):
+        """Ansichtsphase (Schnittplanung) im Hintergrund mit Ladebalken.
+        reset_view=False erhaelt Zoom/Pan (z.B. bei Schnitt-B-Klicks)."""
         if self.geo is None or getattr(self, "_busy_view", False):
             return
         self._busy_view = True
@@ -495,11 +521,16 @@ class App(tk.Tk):
 
         fk = frozenset(self.force_keys)
         sk = frozenset(self.skip_keys)
+        manual_sel = list(self.manual_selection)
+        d2 = self.dir2_var.get()
+        renum = "B" if self.renumber_var.get() == "Schnitt B" else "A"
 
         def worker():
             try:
-                q.put(("ok", hd.analyze_view(geo, view, d, rotation=rot,
-                                             force_keys=fk, skip_keys=sk)))
+                q.put(("ok", hd.analyze_view(
+                    geo, view, d, rotation=rot, force_keys=fk, skip_keys=sk,
+                    manual_selection=manual_sel, manual_direction=d2,
+                    renumber_source=renum)))
             except Exception as e:
                 q.put(("error", e))
 
@@ -520,7 +551,7 @@ class App(tk.Tk):
             self._progress_off()
             if kind == "ok":
                 self.result = payload
-                self._refresh()
+                self._refresh(reset_view=reset_view)
             else:
                 self.lbl_status.config(text="Fehler.")
                 messagebox.showerror("Analysefehler", str(payload))
@@ -593,10 +624,9 @@ class App(tk.Tk):
             messagebox.showerror("Fehler", f"Ungültiges Format: {e}")
 
     # ----------------------------------------------------------- Anzeige
-    def _refresh(self):
+    def _refresh(self, reset_view=True):
         self._progress_off()
         self._populate_tree()
-        self._compute_manual_section()
         self._update_section_lists()
 
         self.txt.delete("1.0", "end")
@@ -604,7 +634,7 @@ class App(tk.Tk):
         if self.manual_selection:
             self.txt.insert("end", "\n\n" + self._manual_section_text())
 
-        self._draw(reset_view=True)
+        self._draw(reset_view=reset_view)
 
         feats = self.result["features"]
         rows = hd.table_rows(feats)
@@ -764,25 +794,6 @@ class App(tk.Tk):
         self.refresh_view()
 
     # ------------------------------------------------- Schnitt B (manuell)
-    def _compute_manual_section(self):
-        if self.result is None:
-            return
-        live_ids = {id(f) for f in self.result["features"]}
-        self.manual_selection = [f for f in self.manual_selection
-                                 if id(f) in live_ids]
-        poly2, hits2 = hd.plan_manual_section(
-            self.manual_selection, self.result["features"],
-            direction=self.dir2_var.get())
-        self.result["section2_poly"] = poly2
-        self.result["section2_hits"] = hits2
-
-    def _rebuild_manual_section(self):
-        if self.result is None:
-            return
-        self._compute_manual_section()
-        self._update_section_lists()
-        self._draw(reset_view=False)
-
     def _remove_selected_manual(self):
         sel = self.lst_secB.curselection()
         if not sel or self.result is None:
@@ -792,11 +803,11 @@ class App(tk.Tk):
             target = hits2[sel[0]]
             self.manual_selection = [m for m in self.manual_selection
                                      if m is not target]
-            self._rebuild_manual_section()
+            self.refresh_view(reset_view=False)
 
     def _reset_manual_section(self):
         self.manual_selection = []
-        self._rebuild_manual_section()
+        self.refresh_view(reset_view=False)
 
     def _manual_section_text(self):
         poly2 = self.result.get("section2_poly") or []
@@ -825,9 +836,11 @@ class App(tk.Tk):
         self.lst_secB.delete(0, "end")
         self._section2_feats = list(self.result.get("section2_hits", []))
         for f in self._section2_feats:
+            ori = {"axial": "axial", "quer": "quer/längs"}.get(
+                f.orientation, f.orientation)
             self.lst_secB.insert(
                 "end", f" {f.type_no:>2}  {f.label:<7} "
-                       f"{'durch' if f.through else 'Sack':<5} axial")
+                       f"{'durch' if f.through else 'Sack':<5} {ori}")
 
     # ------------------------------------------------- Navigation/Fokus
     def _on_sectionA_click(self, _ev):
