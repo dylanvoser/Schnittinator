@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-bohrtool_gui.py — Bohrungserkennung aus STEP (GUI, v2.6)
+bohrtool_gui.py — Schnittinator: Bohrungserkennung aus STEP (GUI, v2.6)
 
 Start:  python bohrtool_gui.py
 
@@ -15,6 +15,7 @@ Bohrtabelle: 👁-Spalte blendet einzelne Bohrnummern aus/ein, Kopf-Knopf alle.
 """
 import csv
 import math
+import os
 import threading
 import queue
 import time
@@ -51,9 +52,10 @@ class NavToolbar(NavigationToolbar2Tk):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Bohrungserkennung aus STEP")
+        self.title("Schnittinator")
         self.geometry("1500x900")
         self.configure(bg=BG)
+        self._set_icon()
         self._setup_style()
 
         self.shape = None
@@ -67,7 +69,11 @@ class App(tk.Tk):
         self.hidden_keys = set()
         self.deleted_keys = set()
         self._delete_stack = []
+        self.split_keys = set()          # Durchgangs-Typen, manuell in 2 Sacklöcher geteilt
+        self._split_stack = []
+        self._filt_cache = None          # s. _filtered_features()
         self.manual_selection = []       # Feature-Objekte fuer Schnitt B
+        self._section_cache = {}         # teurer Stufenschnitt A-A, s. hd.analyze_view
         self._section_feats = []
         self._hl_artist = None
         self._pan_start = None
@@ -76,6 +82,18 @@ class App(tk.Tk):
         self._busy = False
 
         self._build_ui()
+
+    # --------------------------------------------------------------- Icon
+    def _set_icon(self):
+        base = os.path.dirname(os.path.abspath(__file__))
+        try:
+            icons = [tk.PhotoImage(file=os.path.join(base, "assets", n))
+                    for n in ("icon_128.png", "icon_64.png", "icon_32.png",
+                              "icon_16.png")]
+            self._icon_imgs = icons     # Referenz halten (sonst GC'd)
+            self.iconphoto(True, *icons)
+        except Exception:
+            pass                        # z.B. Bilder fehlen -> Standardicon
 
     # ---------------------------------------------------------------- Stil
     def _setup_style(self):
@@ -203,6 +221,14 @@ class App(tk.Tk):
         ttk.Button(row2, text="↺ Löschung rückgängig",
                    command=self._undo_delete)\
             .pack(side="left", fill="x", expand=True, padx=(2, 0))
+        row3 = ttk.Frame(f_types, style="Panel.TFrame")
+        row3.pack(fill="x", pady=(4, 0))
+        ttk.Button(row3, text="✂ In 2 Sacklöcher teilen (Mitte)",
+                   command=self._toggle_split)\
+            .pack(side="left", fill="x", expand=True, padx=(0, 2))
+        ttk.Button(row3, text="↺ Teilung rückgängig",
+                   command=self._undo_split)\
+            .pack(side="left", fill="x", expand=True, padx=(2, 0))
 
         f_sec = ttk.Frame(left, style="Panel.TFrame", padding=6)
         left.add(f_sec, weight=2)
@@ -246,13 +272,24 @@ class App(tk.Tk):
                            state="readonly")
         cb2.pack(side="left", padx=(4, 8))
         cb2.bind("<<ComboboxSelected>>",
-                lambda e: self._rebuild_manual_section())
+                lambda e: self._quick_refresh())
         ttk.Button(rowB, text="✕ Entfernen",
                    command=self._remove_selected_manual)\
             .pack(side="left", padx=2)
         ttk.Button(rowB, text="🗑 Schnitt B zurücksetzen",
                    command=self._reset_manual_section)\
             .pack(side="left", padx=2)
+
+        rowN = ttk.Frame(f_sec, style="Panel.TFrame")
+        rowN.pack(fill="x", pady=(4, 0))
+        ttk.Label(rowN, text="Nummerierung nach:").pack(side="left")
+        self.renumber_var = tk.StringVar(value="Schnitt A")
+        cbN = ttk.Combobox(rowN, textvariable=self.renumber_var,
+                           values=["Schnitt A", "Schnitt B"], width=10,
+                           state="readonly")
+        cbN.pack(side="left", padx=(4, 0))
+        cbN.bind("<<ComboboxSelected>>",
+                lambda e: self._quick_refresh())
 
         f_txt = ttk.Frame(left, style="Panel.TFrame", padding=6)
         left.add(f_txt, weight=1)
@@ -335,17 +372,31 @@ class App(tk.Tk):
         elif ev.button == 1:                   # linke Maustaste = Bohrung waehlen
             self._toggle_hole_at(ev.xdata, ev.ydata)
 
+    @staticmethod
+    def _point_seg_dist(px, py, ax_, ay_, bx, by):
+        dx, dy = bx - ax_, by - ay_
+        ln2 = dx*dx + dy*dy
+        if ln2 < 1e-9:
+            return math.hypot(px - ax_, py - ay_)
+        t = max(0.0, min(1.0, ((px-ax_)*dx + (py-ay_)*dy) / ln2))
+        return math.hypot(px - (ax_ + t*dx), py - (ay_ + t*dy))
+
     def _toggle_hole_at(self, x, y):
-        """Naechstgelegene axiale Bohrung unter dem Klick fuer den
-        manuellen Schnitt B an-/abwaehlen."""
+        """Naechstgelegene Bohrung (axial ODER quer) unter dem Klick fuer
+        den manuellen Schnitt B an-/abwaehlen."""
         if self.result is None:
             return
+        view, rot = self.view_var.get(), self._rotation()
         best, bestd = None, None
         for f in self.result["features"]:
-            if f.orientation != "axial":
+            if f.orientation == "axial":
+                u, v = f.uv
+                d = math.hypot(u - x, v - y)
+            elif f.orientation in ("quer", "schraeg"):
+                a, b = hd.feature_uv_extent(f, view, rot)
+                d = self._point_seg_dist(x, y, a[0], a[1], b[0], b[1])
+            else:
                 continue
-            u, v = f.uv
-            d = math.hypot(u - x, v - y)
             tol = max(f.diameter * 0.9, 3.0)
             if d <= tol and (bestd is None or d < bestd):
                 best, bestd = f, d
@@ -357,7 +408,7 @@ class App(tk.Tk):
             self.manual_selection.append(best)
         else:
             del self.manual_selection[idx]
-        self._rebuild_manual_section()
+        self._quick_refresh()
 
     def _on_motion(self, ev):
         if (self._pan_start is None or ev.inaxes != self.ax
@@ -412,6 +463,8 @@ class App(tk.Tk):
         self.hidden_keys.clear()
         self.deleted_keys.clear()
         self._delete_stack.clear()
+        self.split_keys.clear()
+        self._split_stack.clear()
         self.shape = None
         self.reanalyze()
 
@@ -423,6 +476,7 @@ class App(tk.Tk):
             return
         self._busy = True
         self.manual_selection = []      # alte Feature-Objekte werden ungueltig
+        self._section_cache = {}        # bezog sich auf die alten Objekte
         self._q = queue.Queue()
         self._t0 = time.perf_counter()
         tm = dict(self.thread_map)
@@ -478,28 +532,54 @@ class App(tk.Tk):
         self.progress.stop()
         self.progress.pack_forget()
 
-    def refresh_view(self):
-        """Ansichtsphase (Schnittplanung) im Hintergrund mit Ladebalken."""
+    def _filtered_features(self):
+        """geo['features'] mit angewandten Löschungen/Sackloch-Teilungen —
+        gecacht, damit gleiche Eingaben dieselben Feature-Objekte liefern
+        (sonst würde der Schnitt-A-Cache in hd.analyze_view bei jedem Aufruf
+        unnötig verfallen, da Teilung neue Objekte erzeugt)."""
+        sig = (frozenset(self.deleted_keys), frozenset(self.split_keys))
+        c = self._filt_cache
+        if c is not None and c[0] is self.geo["features"] and c[1] == sig:
+            return c[2]
+        feats = [f for f in self.geo["features"]
+                if hd.type_key(f) not in self.deleted_keys]
+        if self.split_keys:
+            feats = hd.split_hole_types(feats, self.split_keys)
+        self._filt_cache = (self.geo["features"], sig, feats)
+        return feats
+
+    def _analyze_kwargs(self):
+        """Gemeinsame Eingaben fuer hd.analyze_view (Hintergrund- und
+        Schnellpfad)."""
+        self._apply_overrides()
+        geo, view = self.geo, self.view_var.get()
+        d, rot = self.dir_var.get(), self._rotation()
+        if self.deleted_keys or self.split_keys:
+            geo = dict(self.geo)
+            geo["features"] = self._filtered_features()
+        live_ids = {id(f) for f in geo["features"]}
+        self.manual_selection = [f for f in self.manual_selection
+                                 if id(f) in live_ids]
+        renum = "B" if self.renumber_var.get() == "Schnitt B" else "A"
+        return dict(geo=geo, view=view, direction=d, rotation=rot,
+                   force_keys=frozenset(self.force_keys),
+                   skip_keys=frozenset(self.skip_keys),
+                   manual_selection=list(self.manual_selection),
+                   manual_direction=self.dir2_var.get(),
+                   renumber_source=renum, section_cache=self._section_cache)
+
+    def refresh_view(self, reset_view=True):
+        """Ansichtsphase (Schnittplanung) im Hintergrund mit Ladebalken.
+        reset_view=False erhaelt Zoom/Pan (z.B. bei Schnitt-B-Klicks)."""
         if self.geo is None or getattr(self, "_busy_view", False):
             return
         self._busy_view = True
-        self._apply_overrides()
+        kwargs = self._analyze_kwargs()
         q = queue.Queue()
-        geo, view = self.geo, self.view_var.get()
-        d, rot = self.dir_var.get(), self._rotation()
-
-        if self.deleted_keys:
-            geo = dict(self.geo)
-            geo["features"] = [f for f in self.geo["features"]
-                               if hd.type_key(f) not in self.deleted_keys]
-
-        fk = frozenset(self.force_keys)
-        sk = frozenset(self.skip_keys)
 
         def worker():
             try:
-                q.put(("ok", hd.analyze_view(geo, view, d, rotation=rot,
-                                             force_keys=fk, skip_keys=sk)))
+                q.put(("ok", hd.analyze_view(**kwargs)))
             except Exception as e:
                 q.put(("error", e))
 
@@ -520,12 +600,32 @@ class App(tk.Tk):
             self._progress_off()
             if kind == "ok":
                 self.result = payload
-                self._refresh()
+                self._refresh(reset_view=reset_view)
             else:
                 self.lbl_status.config(text="Fehler.")
                 messagebox.showerror("Analysefehler", str(payload))
 
         poll()
+
+    def _quick_refresh(self, reset_view=False):
+        """Synchrone Aktualisierung ohne Hintergrund-Thread, fuer Schnitt-B-
+        Aenderungen (Klick, Entfernen, Zuruecksetzen, Richtung/Nummerierung):
+        dank Schnitt-A-Cache in hd.analyze_view ist das i.d.R. sofort fertig.
+        Faellt auf den Hintergrundpfad zurueck, wenn dieser gerade laeuft
+        (verhindert gleichzeitigen Zugriff auf Cache/Feature-Objekte)."""
+        if self.geo is None:
+            return
+        if getattr(self, "_busy_view", False):
+            self.refresh_view(reset_view=reset_view)
+            return
+        kwargs = self._analyze_kwargs()
+        try:
+            self.result = hd.analyze_view(**kwargs)
+        except Exception as e:
+            self.lbl_status.config(text="Fehler.")
+            messagebox.showerror("Analysefehler", str(e))
+            return
+        self._refresh(reset_view=reset_view)
 
     # ----------------------------------------------- Gewinde-Umschaltung
     def _apply_overrides(self):
@@ -593,10 +693,9 @@ class App(tk.Tk):
             messagebox.showerror("Fehler", f"Ungültiges Format: {e}")
 
     # ----------------------------------------------------------- Anzeige
-    def _refresh(self):
+    def _refresh(self, reset_view=True):
         self._progress_off()
         self._populate_tree()
-        self._compute_manual_section()
         self._update_section_lists()
 
         self.txt.delete("1.0", "end")
@@ -604,7 +703,7 @@ class App(tk.Tk):
         if self.manual_selection:
             self.txt.insert("end", "\n\n" + self._manual_section_text())
 
-        self._draw(reset_view=True)
+        self._draw(reset_view=reset_view)
 
         feats = self.result["features"]
         rows = hd.table_rows(feats)
@@ -763,26 +862,49 @@ class App(tk.Tk):
         self.deleted_keys.discard(key)
         self.refresh_view()
 
+    # ------------------------------------------- Sackloch-Teilung (manuell)
+    def _toggle_split(self):
+        """Zwei von gegenueberliegenden Seiten gebohrte Sacklochbohrungen,
+        die sich genau treffen, ergeben oft eine nahtlose Zylinderflaeche
+        ohne erkennbaren Absatz — von der automatischen Erkennung nicht von
+        einer echten Durchgangsbohrung zu unterscheiden. Korrektur von Hand:
+        ausgewaehlten Durchgangs-Typ in zwei Sacklöcher (je halbe Tiefe)
+        aufteilen."""
+        sel = self.tree.selection()
+        if not sel or self.result is None:
+            return
+        tno = int(self.tree.item(sel[0])["values"][0])
+        f = next((x for x in self.result["features"]
+                  if x.type_no == tno), None)
+        if f is None:
+            return
+        if not f.through:
+            messagebox.showinfo(
+                "Sackloch-Teilung",
+                "Nur Durchgangsbohrungen können in zwei Sacklochbohrungen "
+                "aufgeteilt werden.")
+            return
+        key = hd.type_key(f)
+        if not messagebox.askyesno(
+                "Sackloch-Teilung",
+                f"Typ {tno} ({f.label}, Durchgang) wirklich in zwei "
+                "Sacklochbohrungen aufteilen, die sich in der Mitte "
+                "treffen?\n\nMit '↺ Teilung rückgängig' wiederherstellbar."):
+            return
+        self.split_keys.add(key)
+        self._split_stack.append(key)
+        self.manual_selection = [m for m in self.manual_selection
+                                 if hd.type_key(m) != key]
+        self.refresh_view()
+
+    def _undo_split(self):
+        if not self._split_stack:
+            return
+        key = self._split_stack.pop()
+        self.split_keys.discard(key)
+        self.refresh_view()
+
     # ------------------------------------------------- Schnitt B (manuell)
-    def _compute_manual_section(self):
-        if self.result is None:
-            return
-        live_ids = {id(f) for f in self.result["features"]}
-        self.manual_selection = [f for f in self.manual_selection
-                                 if id(f) in live_ids]
-        poly2, hits2 = hd.plan_manual_section(
-            self.manual_selection, self.result["features"],
-            direction=self.dir2_var.get())
-        self.result["section2_poly"] = poly2
-        self.result["section2_hits"] = hits2
-
-    def _rebuild_manual_section(self):
-        if self.result is None:
-            return
-        self._compute_manual_section()
-        self._update_section_lists()
-        self._draw(reset_view=False)
-
     def _remove_selected_manual(self):
         sel = self.lst_secB.curselection()
         if not sel or self.result is None:
@@ -792,11 +914,11 @@ class App(tk.Tk):
             target = hits2[sel[0]]
             self.manual_selection = [m for m in self.manual_selection
                                      if m is not target]
-            self._rebuild_manual_section()
+            self._quick_refresh()
 
     def _reset_manual_section(self):
         self.manual_selection = []
-        self._rebuild_manual_section()
+        self._quick_refresh()
 
     def _manual_section_text(self):
         poly2 = self.result.get("section2_poly") or []
@@ -825,9 +947,11 @@ class App(tk.Tk):
         self.lst_secB.delete(0, "end")
         self._section2_feats = list(self.result.get("section2_hits", []))
         for f in self._section2_feats:
+            ori = {"axial": "axial", "quer": "quer/längs"}.get(
+                f.orientation, f.orientation)
             self.lst_secB.insert(
                 "end", f" {f.type_no:>2}  {f.label:<7} "
-                       f"{'durch' if f.through else 'Sack':<5} axial")
+                       f"{'durch' if f.through else 'Sack':<5} {ori}")
 
     # ------------------------------------------------- Navigation/Fokus
     def _on_sectionA_click(self, _ev):

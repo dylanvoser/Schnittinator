@@ -1501,9 +1501,10 @@ def plan_step_section(features, view="top", direction="horizontal",
 # die Knicke (Spruenge zwischen den Ebenen) so zu legen, dass sie andere,
 # NICHT ausgewaehlte axiale Bohrungen nach Moeglichkeit nicht kreuzen.
 # ----------------------------------------------------------------------------
-def plan_manual_section(selected, all_features, direction="horizontal",
+def plan_manual_section(selected, all_features, view="top",
+                        direction="horizontal", rotation=0,
                         margin=2.0, cluster_tol=1.0):
-    """Versatzschnitt B-B durch die angeklickten (axialen) Bohrungen.
+    """Versatzschnitt B-B durch die angeklickten Bohrungen (axial ODER quer).
 
     selected      : Liste von Feature-Objekten in Klickreihenfolge (die
                      tatsaechliche Ausgabereihenfolge richtet sich nach der
@@ -1511,8 +1512,13 @@ def plan_manual_section(selected, all_features, direction="horizontal",
                      Klickreihenfolge).
     all_features  : alle Features der aktuellen Ansicht (fuer die
                      Kollisionspruefung der Sprungsegmente).
+    Axialbohrungen liefern einen Punktknoten. Querbohrungen, deren Achse
+    PARALLEL zur Schnittrichtung liegt, liefern einen Intervallknoten (volle
+    Laenge, wie beim automatischen Stufenschnitt); alle anderen Quer-/
+    Schraegbohrungen liefern einen Punktknoten an ihrem Bildmittelpunkt (der
+    Versatz wird so gelegt, dass er dort hindurchlaeuft).
     Rueckgabe: (poly, hits) — poly = Liste (u,v)-Punkte, hits = geschnittene
-    Features in Schnittreihenfolge. ([], []) wenn keine axiale Bohrung
+    Features in Schnittreihenfolge. ([], []) wenn keine schnittbare Bohrung
     ausgewaehlt ist.
     """
     horiz = (direction == "horizontal")
@@ -1520,34 +1526,51 @@ def plan_manual_section(selected, all_features, direction="horizontal",
     def to_st(p):
         return (p[0], p[1]) if horiz else (p[1], p[0])
 
+    def node_of(f):
+        """(s0, s1, t, r) — Axialbohrungen und quer zur Schnittrichtung
+        liegende Querbohrungen ergeben einen Punktknoten (s0==s1); zur
+        Schnittrichtung PARALLELE Querbohrungen ergeben ein Intervall."""
+        r = f.diameter / 2.0
+        if f.orientation == "axial":
+            s, t = to_st(f.uv)
+            return s, s, t, r
+        a, b = feature_uv_extent(f, view, rotation)
+        (sa, ta), (sb, tb) = to_st(a), to_st(b)
+        if f.orientation == "quer" and abs(ta - tb) <= cluster_tol:
+            return min(sa, sb), max(sa, sb), 0.5 * (ta + tb), r
+        s, t = to_st(f.uv)
+        return s, s, t, r
+
     pts = []
     for f in selected:
-        if f.orientation != "axial":
+        if f.orientation not in ("axial", "quer", "schraeg"):
             continue
-        s, t = to_st(f.uv)
-        pts.append((s, t, f))
+        s0, s1, t, r = node_of(f)
+        pts.append((s0, s1, t, f))
     if not pts:
         return [], []
     pts.sort(key=lambda x: x[0])
 
     # in Ebenen-Gruppen (annaehernd gleiches t) zusammenfassen
     groups = []
-    for s, t, f in pts:
+    for s0, s1, t, f in pts:
         if groups and abs(t - groups[-1][0]) <= cluster_tol:
-            groups[-1][1].append((s, f))
+            groups[-1][1].append((s0, s1, f))
         else:
-            groups.append((t, [(s, f)]))
+            groups.append((t, [(s0, s1, f)]))
 
     sel_ids = set(id(f) for f in selected)
-    blockers = [(( f.uv[0] if horiz else f.uv[1]),
-                 (f.uv[1] if horiz else f.uv[0]), f.diameter / 2.0)
-                for f in all_features
-                if f.orientation == "axial" and id(f) not in sel_ids]
+    blockers = []
+    for f in all_features:
+        if id(f) in sel_ids or f.orientation not in ("axial", "quer", "schraeg"):
+            continue
+        s0, s1, t, r = node_of(f)
+        blockers.append((s0, s1, t, r))
 
     def jog_free(s, tlo, thi):
-        for bs, bt, br in blockers:
+        for bs0, bs1, bt, br in blockers:
             if (tlo - br - margin * 0.4 < bt < thi + br + margin * 0.4
-                    and abs(bs - s) < br + margin * 0.4):
+                    and bs0 - br - margin * 0.4 < s < bs1 + br + margin * 0.4):
                 return False
         return True
 
@@ -1568,16 +1591,17 @@ def plan_manual_section(selected, all_features, direction="horizontal",
         return prefer   # kein freier Punkt gefunden -> bestmoegliche Naeherung
 
     lead = 5.0
-    all_s = [s for _, mem in groups for s, _ in mem]
-    smin_all, smax_all = min(all_s) - lead, max(all_s) + lead
+    all_lo = [s0 for _, mem in groups for s0, _, _ in mem]
+    all_hi = [s1 for _, mem in groups for _, s1, _ in mem]
+    smin_all, smax_all = min(all_lo) - lead, max(all_hi) + lead
 
     poly = [(smin_all, groups[0][0])]
     prev_s = smin_all
     for gi in range(len(groups) - 1):
         t_a, mem_a = groups[gi]
         t_b, mem_b = groups[gi + 1]
-        s_a_max = max(s for s, _ in mem_a)
-        s_b_min = min(s for s, _ in mem_b)
+        s_a_max = max(s1 for _, s1, _ in mem_a)
+        s_b_min = min(s0 for s0, _, _ in mem_b)
         lo = max(s_a_max + margin, prev_s + margin)
         hi = max(s_b_min - margin, lo)
         prefer = 0.5 * (lo + hi)
@@ -1587,7 +1611,7 @@ def plan_manual_section(selected, all_features, direction="horizontal",
         prev_s = s_jog
     poly.append((smax_all, groups[-1][0]))
 
-    ordered = [f for _, mem in groups for _, f in mem]
+    ordered = [f for _, mem in groups for _, _, f in mem]
     poly_uv = poly if horiz else [(t, s) for (s, t) in poly]
     return poly_uv, ordered
 
@@ -1634,21 +1658,51 @@ def analyze_geometry(shape_or_path, thread_map=None,
 
 
 def analyze_view(geo, view="top", direction="horizontal", rotation=0,
-                 force_keys=frozenset(), skip_keys=frozenset()):
+                 force_keys=frozenset(), skip_keys=frozenset(),
+                 manual_selection=(), manual_direction="horizontal",
+                 renumber_source="A", section_cache=None):
     """LEICHTE Phase: Orientierung/Projektion (inkl. Bilddrehung),
-    Stufenschnitt, Nummerierung entlang des Schnitts, Text, Aussenkontur."""
+    Stufenschnitt, manueller Zweitschnitt B-B, Nummerierung entlang des
+    gewaehlten Schnitts (renumber_source 'A' oder 'B'), Text, Aussenkontur.
+    manual_selection: Feature-Objekte aus geo['features'] fuer Schnitt B.
+    section_cache: optionales, vom Aufrufer gehaltenes dict — der teure
+    Stufenschnitt A-A (doppelte Planung mit/ohne Spiegelung) wird darin
+    zwischengespeichert und bei unveraenderten Eingaben (Ansicht, Richtung,
+    Drehung, Erzwingen-/Nicht-noetig-Markierungen, Bohrungsmenge)
+    wiederverwendet — wichtig, damit Schnitt-B-Aenderungen (Klick fuer
+    manuelle Bohrungsauswahl) nicht jedes Mal die komplette, aufwendige
+    Stufenschnitt-Optimierung neu durchlaufen."""
     feats = assign_type_numbers(geo["features"])
     feats = classify_view(feats, view, rotation)
     bnds = bounds_uv(geo["shape"], view, rotation)
-    best = None
-    for mir in (False, True):
-        poly_, hits_, raw_, sc_, soft_ = plan_step_section(
-            feats, view, direction, bounds=bnds, rotation=rotation,
-            _mirror=mir, force_keys=force_keys, skip_keys=skip_keys)
-        if best is None or sc_ > best[3]:
-            best = (poly_, hits_, raw_, sc_, soft_)
-    poly, hits, raw_txt, _, soft_sum = best
-    mapping = renumber_by_section(feats, hits)
+
+    cache_key = (view, direction, int(rotation) % 360,
+                frozenset(force_keys), frozenset(skip_keys),
+                tuple(id(f) for f in feats))
+    cached = section_cache.get(cache_key) if section_cache is not None \
+        else None
+    if cached is not None:
+        poly, hits, raw_txt, soft_sum = cached
+    else:
+        best = None
+        for mir in (False, True):
+            poly_, hits_, raw_, sc_, soft_ = plan_step_section(
+                feats, view, direction, bounds=bnds, rotation=rotation,
+                _mirror=mir, force_keys=force_keys, skip_keys=skip_keys)
+            if best is None or sc_ > best[3]:
+                best = (poly_, hits_, raw_, sc_, soft_)
+        poly, hits, raw_txt, _, soft_sum = best
+        if section_cache is not None:
+            section_cache.clear()   # nur die aktuelle Ansicht vorhalten
+            section_cache[cache_key] = (poly, hits, raw_txt, soft_sum)
+
+    poly2, hits2 = plan_manual_section(
+        list(manual_selection), feats, view=view,
+        direction=manual_direction, rotation=rotation) \
+        if manual_selection else ([], [])
+
+    mapping = renumber_by_section(feats, hits2 if renumber_source == "B"
+                                  else hits)
     soft_sum = {mapping.get(t, t): n for t, n in soft_sum.items()}
     section_txt = build_section_text(feats, poly, hits, view, direction,
                                      warn=("WARNUNG" in raw_txt),
@@ -1671,6 +1725,9 @@ def analyze_view(geo, view="top", direction="horizontal", rotation=0,
         "section_poly": poly,
         "section_hits": hits,
         "section_text": section_txt,
+        "section2_poly": poly2,
+        "section2_hits": hits2,
+        "renumber_source": renumber_source,
     })
     return res
 
@@ -1680,6 +1737,35 @@ def analyze(shape_or_path, view="top", thread_map=None,
     """Komfortfunktion: beide Phasen in einem Aufruf."""
     geo = analyze_geometry(shape_or_path, thread_map, thread_requires_chamfer)
     return analyze_view(geo, view, direction)
+
+
+def split_hole_types(features, keys, fraction=0.5):
+    """Manuelle Korrektur: ersetzt jede Instanz eines Durchgangsbohrungs-Typs
+    aus `keys` durch zwei Sacklochbohrungen, die sich bei `fraction` ihrer
+    Tiefe treffen (Standard: exakt in der Mitte).
+
+    Hintergrund: Zwei von gegenueberliegenden Seiten gebohrte Sacklochbohrungen,
+    die sich GENAU treffen (kein Restspalt), erzeugen im B-Rep oft eine
+    durchgehend glatte Zylinderflaeche ohne erkennbaren Absatz — geometrisch
+    nicht von einer echten Durchgangsbohrung zu unterscheiden. Dieser Fall
+    laesst sich nicht zuverlaessig automatisch erkennen und wird daher ueber
+    die Bohrtabelle von Hand korrigiert."""
+    if not keys:
+        return features
+    out = []
+    for f in features:
+        k = type_key(f)
+        if k not in keys or not f.through:
+            out.append(f)
+            continue
+        mid = f.z0 + (f.z1 - f.z0) * fraction
+        for za, zb in ((f.z0, mid), (mid, f.z1)):
+            out.append(Feature(kind=f.kind, diameter=f.diameter,
+                               label=f.label, depth=zb - za, through=False,
+                               axis_pt=f.axis_pt, axis_dir=f.axis_dir,
+                               z0=za, z1=zb, cylinders=list(f.cylinders),
+                               counterbore=f.counterbore))
+    return out
 
 
 def table_rows(features):
