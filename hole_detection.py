@@ -618,8 +618,12 @@ def _fmt(x):
 # ----------------------------------------------------------------------------
 def type_key(f):
     """Stabiler, ansichts-unabhaengiger Typschluessel (fuer Erzwingen /
-    Nicht-noetig-Markierungen im GUI)."""
-    depth_part = None if f.through else round(f.depth/TOL_DEPTH)
+    Nicht-noetig-Markierungen im GUI). Bei Gewinden zaehlt NUR die
+    Gewindelaenge, nie die gesamte Bohrtiefe -- eine Teilgewindebohrung mit
+    gleicher Gewindelaenge, aber anderer (tieferer) Kernbohrung bekommt so
+    dieselbe Nummer wie eine kuerzere Bohrung mit demselben Gewinde."""
+    depth_part = (None if f.through or f.kind == "Gewinde"
+                 else round(f.depth/TOL_DEPTH))
     thr_part = (round(getattr(f, "thread_len", 0.0)/TOL_DEPTH)
                 if f.kind == "Gewinde" else None)
     return (f.kind, f.label, depth_part, thr_part,
@@ -631,10 +635,12 @@ def assign_type_numbers(features):
     def key(f):
         # Durchgangsbohrungen: Tiefe ist KEIN Typmerkmal (Bohrungen, die auf
         # verschiedenen Ebenen beginnen und daher verschieden lang sind,
-        # bekommen dieselbe Nummer). Bei Gewinden zaehlt stattdessen die
-        # GEWINDELAENGE (Teilgewinde-Durchgangsbohrungen mit gleichem
-        # Gewinde, aber anderer Bohrtiefe = gleiche Nummer).
-        depth_part = None if f.through else round(f.depth/TOL_DEPTH)
+        # bekommen dieselbe Nummer). Bei Gewinden IMMER (Durchgang wie
+        # Sackloch) zaehlt stattdessen die GEWINDELAENGE (Teilgewinde-
+        # Bohrungen mit gleichem Gewinde, aber anderer Bohrtiefe =
+        # gleiche Nummer).
+        depth_part = (None if f.through or f.kind == "Gewinde"
+                     else round(f.depth/TOL_DEPTH))
         thr_part = (round(getattr(f, "thread_len", 0.0)/TOL_DEPTH)
                     if f.kind == "Gewinde" else None)
         return (f.kind, f.label, depth_part, thr_part,
