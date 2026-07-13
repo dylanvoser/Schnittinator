@@ -420,22 +420,59 @@ class SolidTester:
         return self._c.State() == TopAbs_State.TopAbs_OUT
 
 
+THROUGH_CONFIRM_DIST = 10.0   # mm, zweite (tiefere) Bestaetigungspruefung
+
 def is_through(tester: "SolidTester", hole: HoleCylinder):
+    """Durchgangspruefung an beiden Enden. Geprueft wird NICHT nur ein
+    einzelner Punkt knapp hinter dem Ende: eine kleine, unabhaengige Tasche
+    oder Kreuzungsbohrung direkt hinter dem eigentlichen Bohrungsende kann
+    dort zufaellig ebenfalls 'ausserhalb' liefern und eine Sacklochbohrung
+    faelschlich als durchgehend erscheinen lassen. Eine zweite, deutlich
+    tiefere Pruefung (THROUGH_CONFIRM_DIST) muss ebenfalls 'ausserhalb'
+    sein -- eine echte Durchgangsoeffnung bleibt dort zuverlaessig offen,
+    eine begrenzte Nachbarkavitaet dagegen nicht."""
     d = hole.axis_dir
     lp = hole.axis_pt
     base = _foot(lp, d)
     res = []
     for z, sgn in ((hole.z0, -1.0), (hole.z1, +1.0)):
-        t = (z - base) + sgn * THROUGH_CLEARANCE
-        res.append(tester.is_outside(lp[0]+t*d[0], lp[1]+t*d[1], lp[2]+t*d[2]))
+        ok = True
+        for clearance in (THROUGH_CLEARANCE, THROUGH_CONFIRM_DIST):
+            t = (z - base) + sgn * clearance
+            if not tester.is_outside(lp[0]+t*d[0], lp[1]+t*d[1], lp[2]+t*d[2]):
+                ok = False
+                break
+        res.append(ok)
     return res[0] and res[1], res
+
+
+def _gap_has_material(tester, axis_pt, axis_dir, base, lo, hi):
+    """Prueft MEHRERE Punkte in der Luecke [lo,hi] (axiale Position,
+    absolut) auf Material. Ein einzelner Punkt (z.B. genau der Mittelpunkt)
+    kann bei langen Luecken zufaellig in einer voellig unabhaengigen
+    Kavitaet (Tasche, Kreuzungsbohrung) liegen und so faelschlich 'kein
+    Material' anzeigen, obwohl entlang der Luecke echtes Material liegt --
+    das fusioniert zwei tatsaechlich getrennte Sacklochbohrungen (z.B. von
+    gegenueberliegenden Seiten eines langen Blocks) faelschlich zu einer
+    scheinbaren Durchgangsbohrung."""
+    span = hi - lo
+    if span <= 0:
+        return False
+    n = min(max(3, int(span // 15) + 1), 15)
+    for i in range(1, n + 1):
+        tm = lo + span * i / (n + 1) - base
+        p = (axis_pt[0]+tm*axis_dir[0], axis_pt[1]+tm*axis_dir[1],
+             axis_pt[2]+tm*axis_dir[2])
+        if not tester.is_outside(*p):
+            return True
+    return False
 
 
 def _split_axial_components(items, tester, axis_pt, axis_dir,
                             get_range, touch_tol=0.3):
     """Objekte auf derselben Achse in zusammenhaengende Bohrungen trennen.
-    Getrennt wird bei einer axialen Luecke, deren Mittelpunkt IM MATERIAL
-    liegt (gespiegelte Bohrungen von zwei Seiten). Liegt die Luecke im
+    Getrennt wird bei einer axialen Luecke, in der IRGENDWO Material liegt
+    (gespiegelte Bohrungen von zwei Seiten). Ist die gesamte Luecke ein
     Hohlraum (z.B. kreuzende Bohrung), bleibt es EINE Bohrung."""
     items = sorted(items, key=lambda it: get_range(it)[0])
     base = _foot(axis_pt, axis_dir)
@@ -445,10 +482,8 @@ def _split_axial_components(items, tester, axis_pt, axis_dir,
         z0, z1 = get_range(it)
         gap = z0 - cur_end
         if gap > touch_tol:
-            tm = 0.5*(cur_end + z0) - base
-            p = (axis_pt[0]+tm*axis_dir[0], axis_pt[1]+tm*axis_dir[1],
-                 axis_pt[2]+tm*axis_dir[2])
-            if not tester.is_outside(*p):      # Material dazwischen -> trennen
+            if _gap_has_material(tester, axis_pt, axis_dir, base,
+                                 cur_end, z0):      # Material dazwischen -> trennen
                 comps.append([])
         comps[-1].append(it)
         cur_end = max(cur_end, z1)
