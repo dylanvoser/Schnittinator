@@ -69,6 +69,9 @@ class App(tk.Tk):
         self.hidden_keys = set()
         self.deleted_keys = set()
         self._delete_stack = []
+        self.split_keys = set()          # Durchgangs-Typen, manuell in 2 Sacklöcher geteilt
+        self._split_stack = []
+        self._filt_cache = None          # s. _filtered_features()
         self.manual_selection = []       # Feature-Objekte fuer Schnitt B
         self._section_cache = {}         # teurer Stufenschnitt A-A, s. hd.analyze_view
         self._section_feats = []
@@ -217,6 +220,14 @@ class App(tk.Tk):
             .pack(side="left", fill="x", expand=True, padx=(0, 2))
         ttk.Button(row2, text="↺ Löschung rückgängig",
                    command=self._undo_delete)\
+            .pack(side="left", fill="x", expand=True, padx=(2, 0))
+        row3 = ttk.Frame(f_types, style="Panel.TFrame")
+        row3.pack(fill="x", pady=(4, 0))
+        ttk.Button(row3, text="✂ In 2 Sacklöcher teilen (Mitte)",
+                   command=self._toggle_split)\
+            .pack(side="left", fill="x", expand=True, padx=(0, 2))
+        ttk.Button(row3, text="↺ Teilung rückgängig",
+                   command=self._undo_split)\
             .pack(side="left", fill="x", expand=True, padx=(2, 0))
 
         f_sec = ttk.Frame(left, style="Panel.TFrame", padding=6)
@@ -452,6 +463,8 @@ class App(tk.Tk):
         self.hidden_keys.clear()
         self.deleted_keys.clear()
         self._delete_stack.clear()
+        self.split_keys.clear()
+        self._split_stack.clear()
         self.shape = None
         self.reanalyze()
 
@@ -519,16 +532,34 @@ class App(tk.Tk):
         self.progress.stop()
         self.progress.pack_forget()
 
+    def _filtered_features(self):
+        """geo['features'] mit angewandten Löschungen/Sackloch-Teilungen —
+        gecacht, damit gleiche Eingaben dieselben Feature-Objekte liefern
+        (sonst würde der Schnitt-A-Cache in hd.analyze_view bei jedem Aufruf
+        unnötig verfallen, da Teilung neue Objekte erzeugt)."""
+        sig = (frozenset(self.deleted_keys), frozenset(self.split_keys))
+        c = self._filt_cache
+        if c is not None and c[0] is self.geo["features"] and c[1] == sig:
+            return c[2]
+        feats = [f for f in self.geo["features"]
+                if hd.type_key(f) not in self.deleted_keys]
+        if self.split_keys:
+            feats = hd.split_hole_types(feats, self.split_keys)
+        self._filt_cache = (self.geo["features"], sig, feats)
+        return feats
+
     def _analyze_kwargs(self):
         """Gemeinsame Eingaben fuer hd.analyze_view (Hintergrund- und
         Schnellpfad)."""
         self._apply_overrides()
         geo, view = self.geo, self.view_var.get()
         d, rot = self.dir_var.get(), self._rotation()
-        if self.deleted_keys:
+        if self.deleted_keys or self.split_keys:
             geo = dict(self.geo)
-            geo["features"] = [f for f in self.geo["features"]
-                               if hd.type_key(f) not in self.deleted_keys]
+            geo["features"] = self._filtered_features()
+        live_ids = {id(f) for f in geo["features"]}
+        self.manual_selection = [f for f in self.manual_selection
+                                 if id(f) in live_ids]
         renum = "B" if self.renumber_var.get() == "Schnitt B" else "A"
         return dict(geo=geo, view=view, direction=d, rotation=rot,
                    force_keys=frozenset(self.force_keys),
@@ -829,6 +860,48 @@ class App(tk.Tk):
             return
         key = self._delete_stack.pop()
         self.deleted_keys.discard(key)
+        self.refresh_view()
+
+    # ------------------------------------------- Sackloch-Teilung (manuell)
+    def _toggle_split(self):
+        """Zwei von gegenueberliegenden Seiten gebohrte Sacklochbohrungen,
+        die sich genau treffen, ergeben oft eine nahtlose Zylinderflaeche
+        ohne erkennbaren Absatz — von der automatischen Erkennung nicht von
+        einer echten Durchgangsbohrung zu unterscheiden. Korrektur von Hand:
+        ausgewaehlten Durchgangs-Typ in zwei Sacklöcher (je halbe Tiefe)
+        aufteilen."""
+        sel = self.tree.selection()
+        if not sel or self.result is None:
+            return
+        tno = int(self.tree.item(sel[0])["values"][0])
+        f = next((x for x in self.result["features"]
+                  if x.type_no == tno), None)
+        if f is None:
+            return
+        if not f.through:
+            messagebox.showinfo(
+                "Sackloch-Teilung",
+                "Nur Durchgangsbohrungen können in zwei Sacklochbohrungen "
+                "aufgeteilt werden.")
+            return
+        key = hd.type_key(f)
+        if not messagebox.askyesno(
+                "Sackloch-Teilung",
+                f"Typ {tno} ({f.label}, Durchgang) wirklich in zwei "
+                "Sacklochbohrungen aufteilen, die sich in der Mitte "
+                "treffen?\n\nMit '↺ Teilung rückgängig' wiederherstellbar."):
+            return
+        self.split_keys.add(key)
+        self._split_stack.append(key)
+        self.manual_selection = [m for m in self.manual_selection
+                                 if hd.type_key(m) != key]
+        self.refresh_view()
+
+    def _undo_split(self):
+        if not self._split_stack:
+            return
+        key = self._split_stack.pop()
+        self.split_keys.discard(key)
         self.refresh_view()
 
     # ------------------------------------------------- Schnitt B (manuell)

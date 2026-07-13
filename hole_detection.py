@@ -1739,6 +1739,35 @@ def analyze(shape_or_path, view="top", thread_map=None,
     return analyze_view(geo, view, direction)
 
 
+def split_hole_types(features, keys, fraction=0.5):
+    """Manuelle Korrektur: ersetzt jede Instanz eines Durchgangsbohrungs-Typs
+    aus `keys` durch zwei Sacklochbohrungen, die sich bei `fraction` ihrer
+    Tiefe treffen (Standard: exakt in der Mitte).
+
+    Hintergrund: Zwei von gegenueberliegenden Seiten gebohrte Sacklochbohrungen,
+    die sich GENAU treffen (kein Restspalt), erzeugen im B-Rep oft eine
+    durchgehend glatte Zylinderflaeche ohne erkennbaren Absatz — geometrisch
+    nicht von einer echten Durchgangsbohrung zu unterscheiden. Dieser Fall
+    laesst sich nicht zuverlaessig automatisch erkennen und wird daher ueber
+    die Bohrtabelle von Hand korrigiert."""
+    if not keys:
+        return features
+    out = []
+    for f in features:
+        k = type_key(f)
+        if k not in keys or not f.through:
+            out.append(f)
+            continue
+        mid = f.z0 + (f.z1 - f.z0) * fraction
+        for za, zb in ((f.z0, mid), (mid, f.z1)):
+            out.append(Feature(kind=f.kind, diameter=f.diameter,
+                               label=f.label, depth=zb - za, through=False,
+                               axis_pt=f.axis_pt, axis_dir=f.axis_dir,
+                               z0=za, z1=zb, cylinders=list(f.cylinders),
+                               counterbore=f.counterbore))
+    return out
+
+
 def table_rows(features):
     """Bohrtabelle: je Typ eine Zeile mit Anzahl."""
     by_type = {}
