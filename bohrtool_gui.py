@@ -15,6 +15,7 @@ Bohrtabelle: 👁-Spalte blendet einzelne Bohrnummern aus/ein, Klick auf die
 👁-Kopfzeile blendet alle aus/ein.
 """
 import csv
+import json
 import math
 import os
 import threading
@@ -78,6 +79,7 @@ class App(tk.Tk):
         self._last_scroll = 0.0
         self._home_lims = None
         self._busy = False
+        self._pending_import = None      # s. import_settings/_apply_pending_import
 
         self._build_ui()
 
@@ -158,10 +160,13 @@ class App(tk.Tk):
         combo("Schnitt:", self.dir_var, ["horizontal", "vertical"], 10,
               self.refresh_view)
 
+        # "Gewinde nur mit Ansenkfase": im GUI ausgeblendet (siehe
+        # thread_requires_chamfer in hd.build_features) — steuert, ob ein
+        # Kernloch ohne modellierten Nennzylinder nur dann als Gewinde
+        # gilt, wenn am Eintritt eine Ansenkfase liegt (True, Standard hier)
+        # oder ob reine Durchmesser-Tabellenzuordnung genuegt (False).
+        # Funktion bleibt aktiv, nur ohne eigenen Schalter im UI.
         self.chamfer_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(top, text="Gewinde nur mit Ansenkfase",
-                        variable=self.chamfer_var,
-                        command=self.reanalyze).pack(side="left", padx=14)
         ttk.Button(top, text="Kernloch-Tabelle…",
                    command=self.edit_thread_map).pack(side="left", padx=4)
 
@@ -170,6 +175,10 @@ class App(tk.Tk):
                          ("CSV", self.export_csv)):
             ttk.Button(top, text=f"⬇ {txt}", command=cmd)\
                 .pack(side="right", padx=3)
+        ttk.Button(top, text="📂 Einstellungen…",
+                   command=self.import_settings).pack(side="right", padx=3)
+        ttk.Button(top, text="💾 Einstellungen…",
+                   command=self.export_settings).pack(side="right", padx=3)
 
         hint = ttk.Frame(self, padding=(10, 0))
         hint.pack(side="top", fill="x")
@@ -505,6 +514,8 @@ class App(tk.Tk):
                     self._busy = False
                     self.geo = payload
                     self.geo.setdefault("outline_cache", {})
+                    if self._pending_import is not None:
+                        self._apply_pending_import()
                     self.refresh_view()
                     return
                 elif kind == "error":
@@ -707,12 +718,14 @@ class App(tk.Tk):
         for f in feats:
             by_no.setdefault(f.type_no, f)
         self._by_no = by_no
+        all_keys = set()
         for r in rows:
             f = by_no.get(r["Nr"])
             mark = ""
             eye = "👁"
             if f is not None:
                 k = hd.type_key(f)
+                all_keys.add(k)
                 if k in self.force_keys:
                     mark = "⚑ "
                 elif k in self.skip_keys:
@@ -725,6 +738,8 @@ class App(tk.Tk):
                              values=(r["Nr"], mark + str(r["Bezeichnung"]),
                                      r["Art"], r["Tiefe"], gt_txt,
                                      r["Anzahl"], eye))
+        all_hidden = bool(all_keys) and all_keys <= self.hidden_keys
+        self.tree.heading("👁", text="🚫" if all_hidden else "👁")
 
     def _draw(self, reset_view=True):
         """Grafik (neu) zeichnen. Bei reset_view=False bleiben Zoom/Pan
@@ -968,6 +983,159 @@ class App(tk.Tk):
         self.fig.savefig(path, dpi=200, bbox_inches="tight",
                          facecolor="white")
         messagebox.showinfo("Export", f"{ext.upper()} gespeichert:\n{path}")
+
+    # ------------------------------------------------- Einstellungen (Platte)
+    @staticmethod
+    def _key_to_json(k):
+        cb = list(k[5]) if k[5] is not None else None
+        return [k[0], k[1], k[2], k[3], k[4], cb]
+
+    @staticmethod
+    def _json_to_key(lst):
+        cb = tuple(lst[5]) if lst[5] is not None else None
+        return (lst[0], lst[1], lst[2], lst[3], lst[4], cb)
+
+    def export_settings(self):
+        """Alle manuellen Einstellungen zu dieser Platte (Ansicht, Schnitt B,
+        Erzwingen/Nicht-nötig/Ausblenden/Löschen, Gewinde-Zuordnung) als JSON
+        sichern — z.B. um spaeter an derselben STEP-Datei weiterzuarbeiten."""
+        if self.geo is None:
+            messagebox.showinfo("Einstellungen exportieren",
+                                "Bitte zuerst eine STEP-Datei laden.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("Schnittinator-Einstellungen", "*.json")],
+            initialfile=(os.path.splitext(
+                os.path.basename(self.step_path or "einstellungen"))[0]
+                + ".schnittinator.json"))
+        if not path:
+            return
+        data = {
+            "schnittinator_settings": 1,
+            "step_file": os.path.basename(self.step_path) if self.step_path
+                        else None,
+            "view": self.view_var.get(),
+            "rotation": self._rotation(),
+            "direction": self.dir_var.get(),
+            "manual_direction": self.dir2_var.get(),
+            "renumber_source": ("B" if self.renumber_var.get() == "Schnitt B"
+                                else "A"),
+            "thread_requires_chamfer": self.chamfer_var.get(),
+            "thread_map": {str(k): v for k, v in self.thread_map.items()},
+            "thread_overrides": {str(k): v for k, v
+                                 in self.thread_overrides.items()},
+            "force_keys": [self._key_to_json(k) for k in self.force_keys],
+            "skip_keys": [self._key_to_json(k) for k in self.skip_keys],
+            "hidden_keys": [self._key_to_json(k) for k in self.hidden_keys],
+            "deleted_keys": [self._key_to_json(k) for k in self.deleted_keys],
+            "manual_selection": [
+                {"axis_pt": list(f.axis_pt), "axis_dir": list(f.axis_dir),
+                 "diameter": f.diameter, "z0": f.z0, "z1": f.z1}
+                for f in self.manual_selection],
+        }
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, ensure_ascii=False)
+        messagebox.showinfo("Einstellungen exportieren",
+                            f"Gespeichert:\n{path}")
+
+    def import_settings(self):
+        if self.geo is None and self.step_path is None:
+            messagebox.showinfo("Einstellungen importieren",
+                                "Bitte zuerst eine STEP-Datei laden.")
+            return
+        path = filedialog.askopenfilename(
+            filetypes=[("Schnittinator-Einstellungen", "*.json"),
+                       ("Alle Dateien", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except Exception as e:
+            messagebox.showerror("Einstellungen importieren",
+                                 f"Datei konnte nicht gelesen werden: {e}")
+            return
+        cur = (os.path.basename(self.step_path) if self.step_path else None)
+        saved = data.get("step_file")
+        if saved and cur and saved != cur:
+            if not messagebox.askyesno(
+                    "Einstellungen importieren",
+                    f"Die Einstellungen wurden für '{saved}' gespeichert, "
+                    f"aktuell ist aber '{cur}' geladen. Trotzdem "
+                    "anwenden? (Bohrungsauswahl für Schnitt B wird nur "
+                    "übernommen, wenn passende Bohrungen gefunden werden)"):
+                return
+
+        self._pending_import = data
+        need_reanalyze = (
+            data.get("thread_requires_chamfer", self.chamfer_var.get())
+            != self.chamfer_var.get()
+            or {float(k): v for k, v in data.get("thread_map", {}).items()}
+            != self.thread_map)
+        if need_reanalyze:
+            self.thread_map = {float(k): v for k, v
+                               in data.get("thread_map", {}).items()} \
+                or self.thread_map
+            self.chamfer_var.set(
+                data.get("thread_requires_chamfer", self.chamfer_var.get()))
+            self.reanalyze()
+        else:
+            self._apply_pending_import()
+            self.refresh_view()
+
+    def _apply_pending_import(self):
+        """Wendet die restlichen (nicht geometriephasen-relevanten)
+        Einstellungen an, nachdem geo (ggf. nach reanalyze) bereit ist."""
+        data = self._pending_import
+        self._pending_import = None
+        if data is None or self.geo is None:
+            return
+        self.thread_overrides = {float(k): v for k, v
+                                 in data.get("thread_overrides", {}).items()}
+        self.view_var.set(data.get("view", self.view_var.get()))
+        self.rot_var.set(f"{int(data.get('rotation', 0)) % 360}°")
+        self.dir_var.set(data.get("direction", self.dir_var.get()))
+        self.dir2_var.set(data.get("manual_direction", self.dir2_var.get()))
+        self.renumber_var.set(
+            "Schnitt B" if data.get("renumber_source", "A") == "B"
+            else "Schnitt A")
+        self.force_keys = {self._json_to_key(k)
+                           for k in data.get("force_keys", [])}
+        self.skip_keys = {self._json_to_key(k)
+                          for k in data.get("skip_keys", [])}
+        self.hidden_keys = {self._json_to_key(k)
+                            for k in data.get("hidden_keys", [])}
+        self.deleted_keys = {self._json_to_key(k)
+                             for k in data.get("deleted_keys", [])}
+
+        feats = self.geo["features"]
+        selection = []
+        missing = 0
+        for desc in data.get("manual_selection", []):
+            best, bestd = None, None
+            for f in feats:
+                dd = sum(abs(f.axis_pt[i] - desc["axis_pt"][i])
+                        for i in range(3))
+                if dd > 1.0 or abs(f.diameter - desc["diameter"]) > 0.5:
+                    continue
+                if (abs(f.z0 - desc["z0"]) > 1.0
+                        or abs(f.z1 - desc["z1"]) > 1.0):
+                    continue
+                if best is None or dd < bestd:
+                    best, bestd = f, dd
+            if best is not None:
+                selection.append(best)
+            else:
+                missing += 1
+        self.manual_selection = selection
+        self._section_cache = {}
+        if missing:
+            messagebox.showwarning(
+                "Einstellungen importieren",
+                f"{missing} Bohrung(en) für Schnitt B konnten in der "
+                "aktuell geladenen Geometrie nicht wiedergefunden werden "
+                "und wurden übersprungen.")
 
 
 if __name__ == "__main__":

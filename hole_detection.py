@@ -558,24 +558,28 @@ def build_features(shape, holes, cones, thread_map=None,
                         thread_from_table = True
                     break
 
+        cyl_z0, cyl_z1 = z0, z1        # Zylinder-/Kernloch-Ausdehnung ALLEIN,
+                                        # ohne Kegel (Bohrerspitze/Fase)
         for c in ax_cones:
             z0 = min(z0, c.v0)
             z1 = max(z1, c.v1)
         main = g[0]
         through, _ = is_through(tester, HoleCylinder(
             main.axis_pt, main.axis_dir, main.radius, z0, z1, 360, 1))
-        depth = z1 - z0
+        depth = z1 - z0              # volle Ausdehnung inkl. Kegel (Senkung!)
+        depth_plain = cyl_z1 - cyl_z0  # ohne Bohrerspitze/Fase am Ende
 
         if thread_label:
             feat = Feature("Gewinde", THREAD_NOMINAL[thread_label], thread_label,
-                           depth, through, main.axis_pt, main.axis_dir,
+                           depth_plain, through, main.axis_pt, main.axis_dir,
                            z0, z1, cylinders=g)
             feat.thread_from_table = thread_from_table
-            # Gewindelaenge = Laenge des Nennzylinders (Teilgewinde!),
-            # sonst volle Tiefe
+            # Gewindelaenge = Laenge des Nennzylinders (Teilgewinde!) bzw.
+            # bei reiner Kernloch-Erkennung die Kernloch-Tiefe OHNE
+            # Bohrerspitze -- "bis zum Spitz" ist keine nutzbare Gewindelaenge.
             dn = THREAD_NOMINAL[thread_label]
             nom = [h for h in g if abs(2*h.radius - dn) <= 0.1]
-            feat.thread_len = (nom[0].z1 - nom[0].z0) if nom else depth
+            feat.thread_len = (nom[0].z1 - nom[0].z0) if nom else depth_plain
         elif len(g) >= 2:
             bigs = [h for h in g if h.radius > main.radius + TOL_RADIUS]
             big = max(bigs, key=lambda h: h.radius)
@@ -592,7 +596,7 @@ def build_features(shape, holes, cones, thread_map=None,
                            main.axis_pt, main.axis_dir, z0, z1, cylinders=g)
         else:
             feat = Feature("Bohrung", 2*main.radius, f"D{_fmt(2*main.radius)}",
-                           depth, through, main.axis_pt, main.axis_dir,
+                           depth_plain, through, main.axis_pt, main.axis_dir,
                            z0, z1, cylinders=g)
         features.append(feat)
     return features
