@@ -11,7 +11,8 @@ Bedienung Grafik:
   Häuschen (Toolbar) = Gesamtansicht, Markierung wird entfernt
   Pfeile ◀ ▶         = zwischen letzten Ansichten wechseln
 Seitenleiste und Teilbereiche sind an den Trennstegen frei verstellbar.
-Bohrtabelle: 👁-Spalte blendet einzelne Bohrnummern aus/ein, Kopf-Knopf alle.
+Bohrtabelle: 👁-Spalte blendet einzelne Bohrnummern aus/ein, Klick auf die
+👁-Kopfzeile blendet alle aus/ein.
 """
 import csv
 import math
@@ -32,8 +33,8 @@ import hole_detection as hd
 import hole_render as hr
 
 VIEWS = ["top", "bottom", "front", "back", "left", "right"]
-ACCENT = "#0057b8"
-BG = "#f4f5f7"
+ACCENT = "#e40033"
+BG = "#f5f5f5"
 PANEL = "#ffffff"
 
 
@@ -69,9 +70,6 @@ class App(tk.Tk):
         self.hidden_keys = set()
         self.deleted_keys = set()
         self._delete_stack = []
-        self.split_keys = set()          # Durchgangs-Typen, manuell in 2 Sacklöcher geteilt
-        self._split_stack = []
-        self._filt_cache = None          # s. _filtered_features()
         self.manual_selection = []       # Feature-Objekte fuer Schnitt B
         self._section_cache = {}         # teurer Stufenschnitt A-A, s. hd.analyze_view
         self._section_feats = []
@@ -108,26 +106,29 @@ class App(tk.Tk):
         st.configure("TFrame", background=BG)
         st.configure("Panel.TFrame", background=PANEL)
         st.configure("TLabel", background=BG)
-        st.configure("Head.TLabel", background=PANEL, foreground="#333",
+        st.configure("Head.TLabel", background=PANEL, foreground="#000000",
                      font=("Segoe UI Semibold", 10))
-        st.configure("Status.TLabel", background=BG,
+        st.configure("Status.TLabel", background=BG, foreground="#000000",
                      font=("Segoe UI", 9))
         st.configure("TButton", padding=(10, 5), relief="flat",
-                     background="#e8eaee")
-        st.map("TButton", background=[("active", "#dbe4f5")])
+                     background="#f0f0f0", foreground="#000000")
+        st.map("TButton",
+               background=[("active", "#e0e0e0"), ("disabled", "#f7f7f7")],
+               foreground=[("disabled", "#a0a0a0")])
         st.configure("Accent.TButton", background=ACCENT,
-                     foreground="white", padding=(12, 6),
+                     foreground="#ffffff", padding=(12, 6),
                      font=("Segoe UI Semibold", 10))
         st.map("Accent.TButton",
-               background=[("active", "#0a6ae0"), ("disabled", "#9bb8dd")])
+               background=[("active", "#b8002a"), ("disabled", "#f2a9b8")])
         st.configure("TCombobox", padding=3)
-        st.configure("TCheckbutton", background=BG)
+        st.configure("TCheckbutton", background=BG, foreground="#000000")
         st.configure("Treeview", rowheight=24, fieldbackground=PANEL,
-                     background=PANEL, borderwidth=0)
+                     background=PANEL, foreground="#000000", borderwidth=0)
         st.configure("Treeview.Heading", font=("Segoe UI Semibold", 9),
-                     background="#e3e6ea", relief="flat")
+                     background="#eeeeee", foreground="#000000",
+                     relief="flat")
         st.map("Treeview", background=[("selected", ACCENT)],
-               foreground=[("selected", "white")])
+               foreground=[("selected", "#ffffff")])
         st.configure("TPanedwindow", background=BG)
 
     # ------------------------------------------------------------------ UI
@@ -187,18 +188,19 @@ class App(tk.Tk):
 
         f_types = ttk.Frame(left, style="Panel.TFrame", padding=6)
         left.add(f_types, weight=2)
-        hdr = ttk.Frame(f_types, style="Panel.TFrame")
-        hdr.pack(fill="x")
-        ttk.Label(hdr, text="Bohrtabelle (Typen)",
-                  style="Head.TLabel").pack(side="left")
-        ttk.Button(hdr, text="👁 Alle Nummern ein-/ausblenden",
-                   command=self._toggle_all_labels).pack(side="right")
-        cols = ("Nr", "Bezeichnung", "Durchmesser", "Art", "Tiefe", "Anzahl",
+        ttk.Label(f_types, text="Bohrtabelle (Typen)  —  👁 in der Kopfzeile "
+                                "blendet alle Nummern aus/ein",
+                  style="Head.TLabel").pack(anchor="w")
+        cols = ("Nr", "DGewinde", "Art", "Tiefe", "Gewindetiefe", "Anzahl",
                 "👁")
+        headings = {"Nr": "Nr", "DGewinde": "Ø / Gewinde", "Art": "Art",
+                   "Tiefe": "Tiefe", "Gewindetiefe": "Gewindetiefe",
+                   "Anzahl": "Anzahl", "👁": "👁"}
         self.tree = ttk.Treeview(f_types, columns=cols, show="headings")
-        for c, w in zip(cols, (40, 90, 90, 190, 55, 55, 30)):
-            self.tree.heading(c, text=c)
+        for c, w in zip(cols, (36, 110, 180, 55, 80, 55, 30)):
+            self.tree.heading(c, text=headings[c])
             self.tree.column(c, width=w, anchor="center", stretch=(c != "👁"))
+        self.tree.heading("👁", command=self._toggle_all_labels)
         self._eye_col_id = f"#{len(cols)}"
         self.tree.pack(fill="both", expand=True, pady=(4, 4))
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_click)
@@ -220,14 +222,6 @@ class App(tk.Tk):
             .pack(side="left", fill="x", expand=True, padx=(0, 2))
         ttk.Button(row2, text="↺ Löschung rückgängig",
                    command=self._undo_delete)\
-            .pack(side="left", fill="x", expand=True, padx=(2, 0))
-        row3 = ttk.Frame(f_types, style="Panel.TFrame")
-        row3.pack(fill="x", pady=(4, 0))
-        ttk.Button(row3, text="✂ In 2 Sacklöcher teilen (Mitte)",
-                   command=self._toggle_split)\
-            .pack(side="left", fill="x", expand=True, padx=(0, 2))
-        ttk.Button(row3, text="↺ Teilung rückgängig",
-                   command=self._undo_split)\
             .pack(side="left", fill="x", expand=True, padx=(2, 0))
 
         f_sec = ttk.Frame(left, style="Panel.TFrame", padding=6)
@@ -273,12 +267,6 @@ class App(tk.Tk):
         cb2.pack(side="left", padx=(4, 8))
         cb2.bind("<<ComboboxSelected>>",
                 lambda e: self._quick_refresh())
-        ttk.Button(rowB, text="✕ Entfernen",
-                   command=self._remove_selected_manual)\
-            .pack(side="left", padx=2)
-        ttk.Button(rowB, text="🗑 Schnitt B zurücksetzen",
-                   command=self._reset_manual_section)\
-            .pack(side="left", padx=2)
 
         rowN = ttk.Frame(f_sec, style="Panel.TFrame")
         rowN.pack(fill="x", pady=(4, 0))
@@ -290,6 +278,15 @@ class App(tk.Tk):
         cbN.pack(side="left", padx=(4, 0))
         cbN.bind("<<ComboboxSelected>>",
                 lambda e: self._quick_refresh())
+
+        rowB2 = ttk.Frame(f_sec, style="Panel.TFrame")
+        rowB2.pack(fill="x", pady=(4, 0))
+        ttk.Button(rowB2, text="✕ Entfernen",
+                   command=self._remove_selected_manual)\
+            .pack(side="left", fill="x", expand=True, padx=(0, 2))
+        ttk.Button(rowB2, text="🗑 Schnitt B zurücksetzen",
+                   command=self._reset_manual_section)\
+            .pack(side="left", fill="x", expand=True, padx=(2, 0))
 
         f_txt = ttk.Frame(left, style="Panel.TFrame", padding=6)
         left.add(f_txt, weight=1)
@@ -463,8 +460,6 @@ class App(tk.Tk):
         self.hidden_keys.clear()
         self.deleted_keys.clear()
         self._delete_stack.clear()
-        self.split_keys.clear()
-        self._split_stack.clear()
         self.shape = None
         self.reanalyze()
 
@@ -532,31 +527,16 @@ class App(tk.Tk):
         self.progress.stop()
         self.progress.pack_forget()
 
-    def _filtered_features(self):
-        """geo['features'] mit angewandten Löschungen/Sackloch-Teilungen —
-        gecacht, damit gleiche Eingaben dieselben Feature-Objekte liefern
-        (sonst würde der Schnitt-A-Cache in hd.analyze_view bei jedem Aufruf
-        unnötig verfallen, da Teilung neue Objekte erzeugt)."""
-        sig = (frozenset(self.deleted_keys), frozenset(self.split_keys))
-        c = self._filt_cache
-        if c is not None and c[0] is self.geo["features"] and c[1] == sig:
-            return c[2]
-        feats = [f for f in self.geo["features"]
-                if hd.type_key(f) not in self.deleted_keys]
-        if self.split_keys:
-            feats = hd.split_hole_types(feats, self.split_keys)
-        self._filt_cache = (self.geo["features"], sig, feats)
-        return feats
-
     def _analyze_kwargs(self):
         """Gemeinsame Eingaben fuer hd.analyze_view (Hintergrund- und
         Schnellpfad)."""
         self._apply_overrides()
         geo, view = self.geo, self.view_var.get()
         d, rot = self.dir_var.get(), self._rotation()
-        if self.deleted_keys or self.split_keys:
+        if self.deleted_keys:
             geo = dict(self.geo)
-            geo["features"] = self._filtered_features()
+            geo["features"] = [f for f in self.geo["features"]
+                               if hd.type_key(f) not in self.deleted_keys]
         live_ids = {id(f) for f in geo["features"]}
         self.manual_selection = [f for f in self.manual_selection
                                  if id(f) in live_ids]
@@ -739,10 +719,12 @@ class App(tk.Tk):
                     mark = "∅ "
                 if k in self.hidden_keys:
                     eye = "🚫"
+            gt = r["Gewindetiefe"]
+            gt_txt = f"{gt:g}" if gt is not None else "–"
             self.tree.insert("", "end",
                              values=(r["Nr"], mark + str(r["Bezeichnung"]),
-                                     r["Durchmesser"], r["Art"],
-                                     r["Tiefe"], r["Anzahl"], eye))
+                                     r["Art"], r["Tiefe"], gt_txt,
+                                     r["Anzahl"], eye))
 
     def _draw(self, reset_view=True):
         """Grafik (neu) zeichnen. Bei reset_view=False bleiben Zoom/Pan
@@ -862,48 +844,6 @@ class App(tk.Tk):
         self.deleted_keys.discard(key)
         self.refresh_view()
 
-    # ------------------------------------------- Sackloch-Teilung (manuell)
-    def _toggle_split(self):
-        """Zwei von gegenueberliegenden Seiten gebohrte Sacklochbohrungen,
-        die sich genau treffen, ergeben oft eine nahtlose Zylinderflaeche
-        ohne erkennbaren Absatz — von der automatischen Erkennung nicht von
-        einer echten Durchgangsbohrung zu unterscheiden. Korrektur von Hand:
-        ausgewaehlten Durchgangs-Typ in zwei Sacklöcher (je halbe Tiefe)
-        aufteilen."""
-        sel = self.tree.selection()
-        if not sel or self.result is None:
-            return
-        tno = int(self.tree.item(sel[0])["values"][0])
-        f = next((x for x in self.result["features"]
-                  if x.type_no == tno), None)
-        if f is None:
-            return
-        if not f.through:
-            messagebox.showinfo(
-                "Sackloch-Teilung",
-                "Nur Durchgangsbohrungen können in zwei Sacklochbohrungen "
-                "aufgeteilt werden.")
-            return
-        key = hd.type_key(f)
-        if not messagebox.askyesno(
-                "Sackloch-Teilung",
-                f"Typ {tno} ({f.label}, Durchgang) wirklich in zwei "
-                "Sacklochbohrungen aufteilen, die sich in der Mitte "
-                "treffen?\n\nMit '↺ Teilung rückgängig' wiederherstellbar."):
-            return
-        self.split_keys.add(key)
-        self._split_stack.append(key)
-        self.manual_selection = [m for m in self.manual_selection
-                                 if hd.type_key(m) != key]
-        self.refresh_view()
-
-    def _undo_split(self):
-        if not self._split_stack:
-            return
-        key = self._split_stack.pop()
-        self.split_keys.discard(key)
-        self.refresh_view()
-
     # ------------------------------------------------- Schnitt B (manuell)
     def _remove_selected_manual(self):
         sel = self.lst_secB.curselection()
@@ -1007,8 +947,8 @@ class App(tk.Tk):
         rows = hd.table_rows(self.result["features"])
         with open(path, "w", newline="", encoding="utf-8-sig") as fh:
             w = csv.DictWriter(fh, fieldnames=["Nr", "Bezeichnung",
-                                               "Durchmesser", "Art",
-                                               "Tiefe", "Anzahl"],
+                                               "Durchmesser", "Art", "Tiefe",
+                                               "Gewindetiefe", "Anzahl"],
                                delimiter=";")
             w.writeheader()
             w.writerows(rows)
