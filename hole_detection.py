@@ -526,15 +526,51 @@ def build_features(shape, holes, cones, thread_map=None,
     for g in axis_groups:
         g.sort(key=lambda h: h.radius)
         radii = [h.radius for h in g]
-        z0 = min(h.z0 for h in g)
-        z1 = max(h.z1 for h in g)
+        cyl_z0 = min(h.z0 for h in g)
+        cyl_z1 = max(h.z1 for h in g)
+        main = g[0]
         # konkave Kegel NUR, wenn sie axial an DIESE Bohrung anschliessen
         ax_cones = [c for c in cones
                     if c.concave
-                    and _same_axis(g[0].axis_pt, g[0].axis_dir,
+                    and _same_axis(main.axis_pt, main.axis_dir,
                                    c.axis_pt, c.axis_dir)
-                    and c.v0 <= z1 + 0.5 and c.v1 >= z0 - 0.5]
-        has_cone = bool(ax_cones)
+                    and c.v0 <= cyl_z1 + 0.5 and c.v1 >= cyl_z0 - 0.5]
+
+        # Durchgangspruefung MIT voll erweiterten (Kegel-inklusive) Enden --
+        # ein Testpunkt knapp hinter der reinen Zylinderkante koennte noch
+        # innerhalb einer angrenzenden Bohrerspitze liegen und faelschlich
+        # als "Material dahinter" durchgehen, statt am wirklichen Ende
+        # (ggf. weit hinter dem Kegel) zu pruefen.
+        full_z0, full_z1 = cyl_z0, cyl_z1
+        for c in ax_cones:
+            full_z0 = min(full_z0, c.v0)
+            full_z1 = max(full_z1, c.v1)
+        through, res = is_through(tester, HoleCylinder(
+            main.axis_pt, main.axis_dir, main.radius, full_z0, full_z1,
+            360, 1))
+
+        # Kegel am EINTRITT (offenes Ende) vs. an der BOHRSPITZE (Sackloch-
+        # Ende) unterscheiden: nur der Eintritts-Kegel ist eine echte
+        # Ansenkfase/Senkung; ein Kegel an der Bohrspitze ist nur die
+        # Bohrerform und zaehlt weder als "Kegelsenkung"-Merkmal noch zur
+        # Gewinde-/Bohrtiefe.
+        if through or not ax_cones:
+            entry_cones, blind_cones = list(ax_cones), []
+        else:
+            entry_at_lo = res[0]
+            entry_cones, blind_cones = [], []
+            for c in ax_cones:
+                mid = 0.5 * (c.v0 + c.v1)
+                near_lo = abs(mid - cyl_z0) <= abs(mid - cyl_z1)
+                (entry_cones if near_lo == entry_at_lo
+                 else blind_cones).append(c)
+        has_cone = bool(entry_cones)
+        # Spanne (nicht Summe!) der Eintritts-Kegel-Segmente -- ein einzelner
+        # physischer Kegel wird wie Zylinderflaechen oft an einer Naht in
+        # mehrere Winkelsegmente mit IDENTISCHEM v0/v1 aufgeteilt.
+        entry_ext = (0.0 if through or not entry_cones
+                    else max(c.v1 for c in entry_cones)
+                         - min(c.v0 for c in entry_cones))
 
         # --- Gewinde-Fall A: Kern- + Nennzylinder modelliert -----------------
         thread_label = None
@@ -558,28 +594,25 @@ def build_features(shape, holes, cones, thread_map=None,
                         thread_from_table = True
                     break
 
-        cyl_z0, cyl_z1 = z0, z1        # Zylinder-/Kernloch-Ausdehnung ALLEIN,
-                                        # ohne Kegel (Bohrerspitze/Fase)
-        for c in ax_cones:
-            z0 = min(z0, c.v0)
-            z1 = max(z1, c.v1)
-        main = g[0]
-        through, _ = is_through(tester, HoleCylinder(
-            main.axis_pt, main.axis_dir, main.radius, z0, z1, 360, 1))
-        depth = z1 - z0              # volle Ausdehnung inkl. Kegel (Senkung!)
-        depth_plain = cyl_z1 - cyl_z0  # ohne Bohrerspitze/Fase am Ende
+        z0, z1 = full_z0, full_z1      # volle Ausdehnung inkl. ALLER Kegel
+                                        # (Eintritt + Bohrspitze) -- fuer
+                                        # Zeichnung/Feature-Position
+        depth = z1 - z0                # volle Ausdehnung inkl. Kegel (Senkung!)
+        depth_plain = cyl_z1 - cyl_z0  # ohne jeden Kegel (Bohrerspitze/Fase)
 
         if thread_label:
             feat = Feature("Gewinde", THREAD_NOMINAL[thread_label], thread_label,
-                           depth_plain, through, main.axis_pt, main.axis_dir,
-                           z0, z1, cylinders=g)
+                           depth_plain + entry_ext, through, main.axis_pt,
+                           main.axis_dir, z0, z1, cylinders=g)
             feat.thread_from_table = thread_from_table
-            # Gewindelaenge = Laenge des Nennzylinders (Teilgewinde!) bzw.
-            # bei reiner Kernloch-Erkennung die Kernloch-Tiefe OHNE
-            # Bohrerspitze -- "bis zum Spitz" ist keine nutzbare Gewindelaenge.
+            # Gewindelaenge = Laenge des Nennzylinders (Teilgewinde!) plus
+            # Eintritts-Ansenkfase, falls vorhanden -- die Fase gehoert zur
+            # nutzbaren Gewindelaenge, die Bohrerspitze am Sackloch-Ende
+            # dagegen nicht.
             dn = THREAD_NOMINAL[thread_label]
             nom = [h for h in g if abs(2*h.radius - dn) <= 0.1]
-            feat.thread_len = (nom[0].z1 - nom[0].z0) if nom else depth_plain
+            feat.thread_len = ((nom[0].z1 - nom[0].z0) if nom
+                               else depth_plain) + entry_ext
         elif len(g) >= 2:
             bigs = [h for h in g if h.radius > main.radius + TOL_RADIUS]
             big = max(bigs, key=lambda h: h.radius)
