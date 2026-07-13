@@ -209,7 +209,7 @@ class App(tk.Tk):
                    command=self.toggle_thread).pack(fill="x")
         row = ttk.Frame(f_types, style="Panel.TFrame")
         row.pack(fill="x", pady=(4, 0))
-        ttk.Button(row, text="⚑ Im Schnitt erzwingen",
+        ttk.Button(row, text="⚑ Erzwingen",
                    command=lambda: self._mark_type("force"))\
             .pack(side="left", fill="x", expand=True, padx=(0, 2))
         ttk.Button(row, text="∅ Nicht nötig",
@@ -217,10 +217,10 @@ class App(tk.Tk):
             .pack(side="left", fill="x", expand=True, padx=(2, 0))
         row2 = ttk.Frame(f_types, style="Panel.TFrame")
         row2.pack(fill="x", pady=(4, 0))
-        ttk.Button(row2, text="🗑 Bohrung löschen (falsch erkannt)",
+        ttk.Button(row2, text="🗑 Löschen",
                    command=self._delete_selected_type)\
             .pack(side="left", fill="x", expand=True, padx=(0, 2))
-        ttk.Button(row2, text="↺ Löschung rückgängig",
+        ttk.Button(row2, text="↺ Rückgängig",
                    command=self._undo_delete)\
             .pack(side="left", fill="x", expand=True, padx=(2, 0))
 
@@ -284,7 +284,7 @@ class App(tk.Tk):
         ttk.Button(rowB2, text="✕ Entfernen",
                    command=self._remove_selected_manual)\
             .pack(side="left", fill="x", expand=True, padx=(0, 2))
-        ttk.Button(rowB2, text="🗑 Schnitt B zurücksetzen",
+        ttk.Button(rowB2, text="🗑 Zurücksetzen",
                    command=self._reset_manual_section)\
             .pack(side="left", fill="x", expand=True, padx=(2, 0))
 
@@ -827,8 +827,8 @@ class App(tk.Tk):
         if not messagebox.askyesno(
                 "Bohrung löschen",
                 f"Typ {tno} ({f.label}, {hd._fmt(f.diameter)} mm) wirklich "
-                "aus der Bohrtabelle löschen?\n\nMit '↺ Löschung "
-                "rückgängig' wiederherstellbar."):
+                "aus der Bohrtabelle löschen?\n\nMit '↺ Rückgängig' "
+                "wiederherstellbar."):
             return
         key = hd.type_key(f)
         self.deleted_keys.add(key)
