@@ -1739,37 +1739,10 @@ def analyze(shape_or_path, view="top", thread_map=None,
     return analyze_view(geo, view, direction)
 
 
-def split_hole_types(features, keys, fraction=0.5):
-    """Manuelle Korrektur: ersetzt jede Instanz eines Durchgangsbohrungs-Typs
-    aus `keys` durch zwei Sacklochbohrungen, die sich bei `fraction` ihrer
-    Tiefe treffen (Standard: exakt in der Mitte).
-
-    Hintergrund: Zwei von gegenueberliegenden Seiten gebohrte Sacklochbohrungen,
-    die sich GENAU treffen (kein Restspalt), erzeugen im B-Rep oft eine
-    durchgehend glatte Zylinderflaeche ohne erkennbaren Absatz — geometrisch
-    nicht von einer echten Durchgangsbohrung zu unterscheiden. Dieser Fall
-    laesst sich nicht zuverlaessig automatisch erkennen und wird daher ueber
-    die Bohrtabelle von Hand korrigiert."""
-    if not keys:
-        return features
-    out = []
-    for f in features:
-        k = type_key(f)
-        if k not in keys or not f.through:
-            out.append(f)
-            continue
-        mid = f.z0 + (f.z1 - f.z0) * fraction
-        for za, zb in ((f.z0, mid), (mid, f.z1)):
-            out.append(Feature(kind=f.kind, diameter=f.diameter,
-                               label=f.label, depth=zb - za, through=False,
-                               axis_pt=f.axis_pt, axis_dir=f.axis_dir,
-                               z0=za, z1=zb, cylinders=list(f.cylinders),
-                               counterbore=f.counterbore))
-    return out
-
-
 def table_rows(features):
-    """Bohrtabelle: je Typ eine Zeile mit Anzahl."""
+    """Bohrtabelle: je Typ eine Zeile mit Anzahl. Gewindetiefe ist nur bei
+    Gewinden gesetzt (sonst None) — die tatsaechlich tragende Gewindelaenge,
+    die von der Bohrtiefe abweichen kann (Teilgewinde)."""
     by_type = {}
     for f in features:
         by_type.setdefault(f.type_no, []).append(f)
@@ -1784,10 +1757,13 @@ def table_rows(features):
             art = f"Senkung D{_fmt(f.counterbore[0])}x{_fmt(f.counterbore[1])}, {art}"
         elif f.kind == "Kegelsenkung":
             art = f"Kegelsenkung, {art}"
+        thread_depth = (round(getattr(f, "thread_len", f.depth), 2)
+                        if f.kind == "Gewinde" else None)
         rows.append({
             "Nr": tno, "Bezeichnung": f.label,
             "Durchmesser": round(f.diameter, 2),
             "Art": art, "Tiefe": round(f.depth, 2),
+            "Gewindetiefe": thread_depth,
             "Anzahl": len(fs),
         })
     return rows
