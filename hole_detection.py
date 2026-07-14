@@ -132,6 +132,9 @@ class HoleCylinder:
     z1: float
     coverage_deg: float
     n_segments: int
+    spans: tuple = ()        # rohe (v0,v1)-Teilspannen der Einzelflaechen --
+                             # interne Flaechengrenzen markieren z.B. das
+                             # Gewindeende eines Teilgewindes
 
 
 @dataclass
@@ -363,8 +366,10 @@ def merge_cylinders(segs, tester=None):
             z0 = min(z0, s.v0)
             z1 = max(z1, s.v1)
         cov = _merge_angular_intervals(intervals)
+        spans = tuple(sorted(set((round(s.v0, 3), round(s.v1, 3))
+                                 for s in g)))
         holes.append(HoleCylinder(ref.axis_pt, d, ref.radius, z0, z1,
-                                  cov, len(g)))
+                                  cov, len(g), spans))
     return holes
 
 
@@ -585,6 +590,26 @@ def build_features(shape, holes, cones, thread_map=None,
                     else max(c.v1 for c in entry_cones)
                          - min(c.v0 for c in entry_cones))
 
+        # Eintrittsseite + Fasenlaenge fuer die Gewindelaengen-Ermittlung:
+        # bei Sackloechern liefert die Durchgangspruefung die offene Seite;
+        # bei Durchgangsbohrungen verraet sie die Fase, sofern sie nur an
+        # einem Ende sitzt.
+        if through:
+            tol_e = 0.5
+            lo_c = [c for c in ax_cones
+                    if abs(c.v1 - cyl_z0) <= tol_e or abs(c.v0 - cyl_z0) <= tol_e]
+            hi_c = [c for c in ax_cones
+                    if abs(c.v0 - cyl_z1) <= tol_e or abs(c.v1 - cyl_z1) <= tol_e]
+            entry_known = bool(lo_c) != bool(hi_c)
+            entry_lo = bool(lo_c)
+            ec = lo_c or hi_c
+            chamfer_ext = (max(c.v1 for c in ec) - min(c.v0 for c in ec)
+                           if entry_known and ec else 0.0)
+        else:
+            entry_known = res[0] != res[1]
+            entry_lo = res[0]
+            chamfer_ext = entry_ext
+
         # --- Gewinde-Fall A: Kern- + Nennzylinder modelliert -----------------
         thread_label = None
         if len(g) >= 2:
@@ -621,11 +646,20 @@ def build_features(shape, holes, cones, thread_map=None,
             # Gewindelaenge = Laenge des Nennzylinders (Teilgewinde!) plus
             # Eintritts-Ansenkfase, falls vorhanden -- die Fase gehoert zur
             # nutzbaren Gewindelaenge, die Bohrerspitze am Sackloch-Ende
-            # dagegen nicht.
+            # dagegen nicht. Bei Nur-Kernloch-Gewinden (Fall B) endet ein
+            # Teilgewinde ggf. mitten in der Bohrung: das CAD-Modell
+            # markiert die Grenze als saubere Flaechenkante im radius-
+            # gleichen Kernloch-Zylinder (_thread_len_from_spans).
             dn = THREAD_NOMINAL[thread_label]
             nom = [h for h in g if abs(2*h.radius - dn) <= 0.1]
-            feat.thread_len = ((nom[0].z1 - nom[0].z0) if nom
-                               else depth_plain) + entry_ext
+            if nom:
+                feat.thread_len = (nom[0].z1 - nom[0].z0) + entry_ext
+            else:
+                tl = (_thread_len_from_spans(getattr(g[0], "spans", ()),
+                                             cyl_z0, cyl_z1, entry_lo)
+                      if entry_known else None)
+                feat.thread_len = ((tl + chamfer_ext) if tl is not None
+                                   else depth_plain + entry_ext)
         elif len(g) >= 2:
             bigs = [h for h in g if h.radius > main.radius + TOL_RADIUS]
             big = max(bigs, key=lambda h: h.radius)
@@ -658,6 +692,27 @@ def _core_for(name, thread_map):
         if n == name:
             return core
     return None
+
+
+def _thread_len_from_spans(spans, cyl_z0, cyl_z1, entry_at_lo, tol=0.05):
+    """Gewindeende eines Teilgewindes aus den Teilflaechen des Kernloch-
+    Zylinders ableiten: endet das Gewinde vor dem Bohrungsende, modelliert
+    das CAD die Grenze als saubere Kante -- zwei axial EXAKT aneinander-
+    stossende Teilflaechen gleichen Radius. Liefert die Zylinderlaenge vom
+    Eintritt bis zur ersten solchen Grenze, sonst None (= Gewinde ueber die
+    ganze Bohrung). Unterbrechungen durch kreuzende Bohrungen erzeugen
+    dagegen Ueberlappungen oder Luecken der Teilspannen und zaehlen nicht
+    als Gewindegrenze."""
+    uniq = sorted(set((round(a, 3), round(b, 3)) for a, b in spans))
+    if len(uniq) < 2:
+        return None
+    bounds = []
+    for (a1, b1), (a2, b2) in zip(uniq, uniq[1:]):
+        if abs(a2 - b1) <= tol and b1 - cyl_z0 > tol and cyl_z1 - b1 > tol:
+            bounds.append(b1)
+    if not bounds:
+        return None
+    return (bounds[0] - cyl_z0) if entry_at_lo else (cyl_z1 - bounds[-1])
 
 
 def _fmt(x):
