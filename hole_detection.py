@@ -553,17 +553,30 @@ def build_features(shape, holes, cones, thread_map=None,
         # Ende) unterscheiden: nur der Eintritts-Kegel ist eine echte
         # Ansenkfase/Senkung; ein Kegel an der Bohrspitze ist nur die
         # Bohrerform und zaehlt weder als "Kegelsenkung"-Merkmal noch zur
-        # Gewinde-/Bohrtiefe.
+        # Gewinde-/Bohrtiefe. Ein Kegel zaehlt nur dann als Eintritts- bzw.
+        # Bohrspitzen-Kegel, wenn er UNMITTELBAR an die aeussere Kante der
+        # Bohrung anschliesst (nicht nur "naeher an der einen Seite") --
+        # ein interner Uebergangskegel (z.B. Kern- auf Senkungsdurchmesser
+        # bei einer Senkbohrung) beruehrt keine der beiden Aussenkanten und
+        # zaehlt zu keinem der beiden Faelle.
         if through or not ax_cones:
             entry_cones, blind_cones = list(ax_cones), []
         else:
+            tol = 0.5
             entry_at_lo = res[0]
+            entry_z = cyl_z0 if entry_at_lo else cyl_z1
+            blind_z = cyl_z1 if entry_at_lo else cyl_z0
             entry_cones, blind_cones = [], []
             for c in ax_cones:
-                mid = 0.5 * (c.v0 + c.v1)
-                near_lo = abs(mid - cyl_z0) <= abs(mid - cyl_z1)
-                (entry_cones if near_lo == entry_at_lo
-                 else blind_cones).append(c)
+                touches_entry = (abs(c.v0 - entry_z) <= tol
+                                 or abs(c.v1 - entry_z) <= tol)
+                touches_blind = (abs(c.v0 - blind_z) <= tol
+                                 or abs(c.v1 - blind_z) <= tol)
+                if touches_entry and not touches_blind:
+                    entry_cones.append(c)
+                elif touches_blind and not touches_entry:
+                    blind_cones.append(c)
+                # sonst: interner Uebergangskegel -- weder noch, ignorieren
         has_cone = bool(entry_cones)
         # Spanne (nicht Summe!) der Eintritts-Kegel-Segmente -- ein einzelner
         # physischer Kegel wird wie Zylinderflaechen oft an einer Naht in
@@ -618,14 +631,19 @@ def build_features(shape, holes, cones, thread_map=None,
             big = max(bigs, key=lambda h: h.radius)
             cb_depth = big.z1 - big.z0
             both = len(bigs) >= 2   # Senkung an beiden Enden
+            # Sackloch: Bohrerspitze am blinden Ende bleibt aussen vor (wie
+            # bei Bohrung/Gewinde); Durchgang: beide Enden sind offen,
+            # volle Ausdehnung bleibt wie gehabt.
+            report_depth = depth if through else (depth_plain + entry_ext)
             feat = Feature("Senkbohrung", 2*main.radius,
-                           f"D{_fmt(2*main.radius)}", depth, through,
+                           f"D{_fmt(2*main.radius)}", report_depth, through,
                            main.axis_pt, main.axis_dir, z0, z1, cylinders=g,
                            counterbore=(2*big.radius, cb_depth))
             feat.counterbore_both = both
         elif has_cone:
+            report_depth = depth if through else (depth_plain + entry_ext)
             feat = Feature("Kegelsenkung", 2*main.radius,
-                           f"D{_fmt(2*main.radius)}", depth, through,
+                           f"D{_fmt(2*main.radius)}", report_depth, through,
                            main.axis_pt, main.axis_dir, z0, z1, cylinders=g)
         else:
             feat = Feature("Bohrung", 2*main.radius, f"D{_fmt(2*main.radius)}",
