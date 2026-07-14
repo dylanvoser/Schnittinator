@@ -733,10 +733,17 @@ class App(tk.Tk):
                 if k in self.hidden_keys:
                     eye = "🚫"
             gt = r["Gewindetiefe"]
-            gt_txt = f"{gt:g}" if gt is not None else "–"
+            if gt is not None:
+                gt_txt = f"{gt:g}"
+            elif "Gewinde, Durchgang" in r["Art"]:
+                gt_txt = "durch"       # durchgehendes Gewinde
+            else:
+                gt_txt = "–"
+            t = r["Tiefe"]
+            t_txt = f"{t:g}" if t is not None else "–"   # Durchgang: keine Tiefe
             self.tree.insert("", "end",
                              values=(r["Nr"], mark + str(r["Bezeichnung"]),
-                                     r["Art"], r["Tiefe"], gt_txt,
+                                     r["Art"], t_txt, gt_txt,
                                      r["Anzahl"], eye))
         all_hidden = bool(all_keys) and all_keys <= self.hidden_keys
         self.tree.heading("👁", text="🚫" if all_hidden else "👁")
