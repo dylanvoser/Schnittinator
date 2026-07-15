@@ -639,10 +639,6 @@ def build_features(shape, holes, cones, thread_map=None,
         depth_plain = cyl_z1 - cyl_z0  # ohne jeden Kegel (Bohrerspitze/Fase)
 
         if thread_label:
-            feat = Feature("Gewinde", THREAD_NOMINAL[thread_label], thread_label,
-                           depth_plain + entry_ext, through, main.axis_pt,
-                           main.axis_dir, z0, z1, cylinders=g)
-            feat.thread_from_table = thread_from_table
             # Gewindelaenge = Laenge des Nennzylinders (Teilgewinde!) plus
             # Eintritts-Ansenkfase, falls vorhanden -- die Fase gehoert zur
             # nutzbaren Gewindelaenge, die Bohrerspitze am Sackloch-Ende
@@ -652,14 +648,42 @@ def build_features(shape, holes, cones, thread_map=None,
             # gleichen Kernloch-Zylinder (_thread_len_from_spans).
             dn = THREAD_NOMINAL[thread_label]
             nom = [h for h in g if abs(2*h.radius - dn) <= 0.1]
+            # Fase an der GEWINDE-Eintrittsseite (Uebergangs-/Fremdkegel am
+            # anderen Ende gehoeren nicht zu diesem Gewinde): bei Fall A
+            # liegt der Eintritt am aeusseren Ende des Nennzylinders, bei
+            # Fall B an der ueber Fase/offene Seite bestimmten Seite.
             if nom:
-                feat.thread_len = (nom[0].z1 - nom[0].z0) + entry_ext
+                ent_lo = (abs(nom[0].z0 - cyl_z0)
+                          <= abs(cyl_z1 - nom[0].z1))
+                edge = cyl_z0 if ent_lo else cyl_z1
+                ec = [c for c in ax_cones
+                      if abs(c.v1 - edge) <= 0.5 or abs(c.v0 - edge) <= 0.5]
+                fase = (max(c.v1 for c in ec) - min(c.v0 for c in ec)
+                        if ec else 0.0)
+            else:
+                fase = chamfer_ext if entry_known else 0.0
+            # Bohrtiefe: vom Gewindebeginn (inkl. Eintrittsfase) bis zum
+            # Bohrungsende; beim Sackloch endet sie am Beginn der
+            # Bohrerspitze (depth_plain schliesst diese bereits aus).
+            bohr_tiefe = depth_plain + fase
+            feat = Feature("Gewinde", THREAD_NOMINAL[thread_label], thread_label,
+                           bohr_tiefe, through, main.axis_pt,
+                           main.axis_dir, z0, z1, cylinders=g)
+            feat.thread_from_table = thread_from_table
+            if nom:
+                feat.thread_len = (nom[0].z1 - nom[0].z0) + fase
             else:
                 tl = (_thread_len_from_spans(getattr(g[0], "spans", ()),
                                              cyl_z0, cyl_z1, entry_lo)
                       if entry_known else None)
-                feat.thread_len = ((tl + chamfer_ext) if tl is not None
-                                   else depth_plain + entry_ext)
+                feat.thread_len = ((tl + fase) if tl is not None
+                                   else bohr_tiefe)
+            # Durchgehendes Gewinde (Gewinde ueber die ganze Bohrung bei
+            # einer Durchgangsbohrung): Laenge ist nur die Materialdicke,
+            # keine echte Gewindeangabe -> None (Anzeige "durch", ein Typ
+            # unabhaengig von der Dicke).
+            if through and feat.thread_len >= depth_plain - 0.5:
+                feat.thread_len = None
         elif len(g) >= 2:
             bigs = [h for h in g if h.radius > main.radius + TOL_RADIUS]
             big = max(bigs, key=lambda h: h.radius)
@@ -727,11 +751,14 @@ def type_key(f):
     Nicht-noetig-Markierungen im GUI). Bei Gewinden zaehlt NUR die
     Gewindelaenge, nie die gesamte Bohrtiefe -- eine Teilgewindebohrung mit
     gleicher Gewindelaenge, aber anderer (tieferer) Kernbohrung bekommt so
-    dieselbe Nummer wie eine kuerzere Bohrung mit demselben Gewinde."""
+    dieselbe Nummer wie eine kuerzere Bohrung mit demselben Gewinde.
+    Durchgehende Gewinde (thread_len None) gelten unabhaengig von der
+    Materialdicke als derselbe Typ."""
     depth_part = (None if f.through or f.kind == "Gewinde"
                  else round(f.depth/TOL_DEPTH))
-    thr_part = (round(getattr(f, "thread_len", 0.0)/TOL_DEPTH)
-                if f.kind == "Gewinde" else None)
+    tl = getattr(f, "thread_len", None)
+    thr_part = (round(tl/TOL_DEPTH)
+                if f.kind == "Gewinde" and tl is not None else None)
     return (f.kind, f.label, depth_part, thr_part,
             f.through, f.counterbore and (round(f.counterbore[0], 2),
                                           round(f.counterbore[1], 1)))
@@ -744,11 +771,13 @@ def assign_type_numbers(features):
         # bekommen dieselbe Nummer). Bei Gewinden IMMER (Durchgang wie
         # Sackloch) zaehlt stattdessen die GEWINDELAENGE (Teilgewinde-
         # Bohrungen mit gleichem Gewinde, aber anderer Bohrtiefe =
-        # gleiche Nummer).
+        # gleiche Nummer); durchgehende Gewinde (thread_len None) sind
+        # unabhaengig von der Materialdicke derselbe Typ.
         depth_part = (None if f.through or f.kind == "Gewinde"
                      else round(f.depth/TOL_DEPTH))
-        thr_part = (round(getattr(f, "thread_len", 0.0)/TOL_DEPTH)
-                    if f.kind == "Gewinde" else None)
+        tl = getattr(f, "thread_len", None)
+        thr_part = (round(tl/TOL_DEPTH)
+                    if f.kind == "Gewinde" and tl is not None else None)
         return (f.kind, f.label, depth_part, thr_part,
                 f.through, f.counterbore and (round(f.counterbore[0], 2),
                                               round(f.counterbore[1], 1)))
@@ -1893,7 +1922,10 @@ def analyze(shape_or_path, view="top", thread_map=None,
 def table_rows(features):
     """Bohrtabelle: je Typ eine Zeile mit Anzahl. Gewindetiefe ist nur bei
     Gewinden gesetzt (sonst None) — die tatsaechlich tragende Gewindelaenge,
-    die von der Bohrtiefe abweichen kann (Teilgewinde)."""
+    die von der Bohrtiefe abweichen kann (Teilgewinde). Durchgangsbohrungen
+    (inkl. Durchgangs-/Teilgewinde) haben KEINE Tiefenangabe — sie gelten
+    unabhaengig von der Materialdicke als dieselbe Bohrung; bei einem
+    durchgehenden Gewinde ist auch die Gewindetiefe None."""
     by_type = {}
     for f in features:
         by_type.setdefault(f.type_no, []).append(f)
@@ -1908,12 +1940,15 @@ def table_rows(features):
             art = f"Senkung D{_fmt(f.counterbore[0])}x{_fmt(f.counterbore[1])}, {art}"
         elif f.kind == "Kegelsenkung":
             art = f"Kegelsenkung, {art}"
-        thread_depth = (round(getattr(f, "thread_len", f.depth), 2)
-                        if f.kind == "Gewinde" else None)
+        thread_depth = None
+        if f.kind == "Gewinde":
+            tl = getattr(f, "thread_len", None)
+            thread_depth = round(tl, 2) if tl is not None else None
         rows.append({
             "Nr": tno, "Bezeichnung": f.label,
             "Durchmesser": round(f.diameter, 2),
-            "Art": art, "Tiefe": round(f.depth, 2),
+            "Art": art,
+            "Tiefe": None if f.through else round(f.depth, 2),
             "Gewindetiefe": thread_depth,
             "Anzahl": len(fs),
         })
