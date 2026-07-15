@@ -1934,16 +1934,20 @@ def table_rows(features):
         fs = by_type[tno]
         f = fs[0]
         art = ("Durchgang" if f.through else "Sackloch")
-        if f.kind == "Gewinde":
-            art = f"Gewinde, {art}"
-        elif f.kind == "Senkbohrung":
-            art = f"Senkung D{_fmt(f.counterbore[0])}x{_fmt(f.counterbore[1])}, {art}"
-        elif f.kind == "Kegelsenkung":
-            art = f"Kegelsenkung, {art}"
         thread_depth = None
         if f.kind == "Gewinde":
             tl = getattr(f, "thread_len", None)
             thread_depth = round(tl, 2) if tl is not None else None
+            if not f.through:
+                art = "Gewinde, Sackloch"
+            elif tl is None:
+                art = "Durchgangsgewinde"      # Gewinde ueber die ganze Bohrung
+            else:
+                art = "Teilgewinde, Durchgang"  # Gewinde nur teilweise, Rest Kernloch
+        elif f.kind == "Senkbohrung":
+            art = f"Senkung D{_fmt(f.counterbore[0])}x{_fmt(f.counterbore[1])}, {art}"
+        elif f.kind == "Kegelsenkung":
+            art = f"Kegelsenkung, {art}"
         rows.append({
             "Nr": tno, "Bezeichnung": f.label,
             "Durchmesser": round(f.diameter, 2),
