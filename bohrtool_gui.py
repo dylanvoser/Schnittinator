@@ -735,8 +735,8 @@ class App(tk.Tk):
             gt = r["Gewindetiefe"]
             if gt is not None:
                 gt_txt = f"{gt:g}"
-            elif "Gewinde, Durchgang" in r["Art"]:
-                gt_txt = "durch"       # durchgehendes Gewinde
+            elif r["Art"] == "Durchgangsgewinde":
+                gt_txt = "durch"       # Gewinde ueber die ganze Bohrung
             else:
                 gt_txt = "–"
             t = r["Tiefe"]
