@@ -172,7 +172,8 @@ class App(tk.Tk):
 
         for txt, cmd in (("PNG", lambda: self.export_fig("png")),
                          ("SVG", lambda: self.export_fig("svg")),
-                         ("CSV", self.export_csv)):
+                         ("CSV", self.export_csv),
+                         ("LSP", self.export_lsp)):
             ttk.Button(top, text=f"⬇ {txt}", command=cmd)\
                 .pack(side="right", padx=3)
         ttk.Button(top, text="📂 Einstellungen…",
@@ -978,6 +979,34 @@ class App(tk.Tk):
             for line in self.result["section_text"].splitlines():
                 fh.write(f"{line}\n")
         messagebox.showinfo("Export", f"CSV gespeichert:\n{path}")
+
+    def export_lsp(self):
+        """Bohrnummern als Creo-Elements/Direct-Lisp-Makro (.lsp) exportieren:
+        legt beim Ausfuehren in Creo an jeder Bohrung eine 3D-Annotation mit
+        der Bohrnummer an (Texthoehe 3.5)."""
+        if self.result is None:
+            return
+        default = "bohrnummern.lsp"
+        if self.step_path:
+            default = (os.path.splitext(os.path.basename(self.step_path))[0]
+                       + "_bohrnummern.lsp")
+        path = filedialog.asksaveasfilename(
+            defaultextension=".lsp",
+            filetypes=[("Creo-Elements/Direct-Makro", "*.lsp")],
+            initialfile=default)
+        if not path:
+            return
+        feats = [f for f in self.result["features"]
+                 if hd.type_key(f) not in self.hidden_keys]
+        text = hd.lsp_annotations(feats, size=3.5)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        messagebox.showinfo(
+            "Export",
+            f"LSP gespeichert:\n{path}\n\n{len(feats)} Bohrungen beschriftet "
+            "(Texthöhe 3.5).\n\nIn Creo Elements/Direct Modeling laden; passt "
+            "die Annotation nicht, nur die Funktion HOLE-LABEL in der Datei "
+            "anpassen.")
 
     def export_fig(self, ext):
         if self.result is None:

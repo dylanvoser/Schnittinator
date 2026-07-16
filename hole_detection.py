@@ -1919,6 +1919,75 @@ def analyze(shape_or_path, view="top", thread_map=None,
     return analyze_view(geo, view, direction)
 
 
+# ----------------------------------------------------------------------------
+# LSP-Export (Creo Elements/Direct Modeling): Bohrnummern als 3D-Annotationen
+# ----------------------------------------------------------------------------
+def feature_annotation_point(f: Feature):
+    """Welt-3D-Punkt (x, y, z) am Bohrungseingang fuer die Beschriftung.
+    Verwendet das obere Ende (z1) der Bohrachse -- bei den ueblichen von
+    oben gebohrten Platten (Achse +Z) liegt die Beschriftung damit auf der
+    Deckflaeche am Bohrungseingang; bei Querbohrungen an der Austrittskante.
+    Die Koordinaten sind absolute Modellkoordinaten (wie in der STEP-Datei),
+    landen also beim Laden desselben Modells in Creo direkt an der Bohrung."""
+    d = f.axis_dir
+    base = _foot(f.axis_pt, d)
+    t = f.z1 - base
+    return (f.axis_pt[0] + t*d[0],
+            f.axis_pt[1] + t*d[1],
+            f.axis_pt[2] + t*d[2])
+
+
+def lsp_annotations(features, size=3.5):
+    """Erzeugt den Inhalt einer .lsp-Makrodatei fuer Creo Elements/Direct
+    Modeling, die an jeder Bohrung eine 3D-Text-Annotation mit der
+    Bohrnummer (f.type_no) anlegt. `size` ist die Texthoehe.
+
+    Die tatsaechliche Platzierung ist in EINER Hilfsfunktion (hole-label)
+    gekapselt: falls die Creo-Version einen anderen Annotationsbefehl
+    verwendet, muss nur diese Funktion angepasst werden -- die erzeugten
+    Datenzeilen bleiben unveraendert."""
+    def fnum(x):
+        return f"{x:.3f}".rstrip("0").rstrip(".")
+
+    lines = [
+        ";; ===================================================================",
+        ";;  Schnittinator - Bohrnummern-Annotationen",
+        ";;  fuer Creo Elements/Direct Modeling (Lisp-Makro)",
+        ";; ===================================================================",
+        ";;  Laden:  (load \"C:/pfad/zu/dieser/datei.lsp\")",
+        ";;          oder ueber  Datei -> Programmieren -> Laden",
+        ";;",
+        f";;  Legt an jeder Bohrung eine 3D-Notiz mit der Bohrnummer an.",
+        f";;  Texthoehe: {fnum(size)}",
+        ";;",
+        ";;  Koordinaten sind absolute Modellkoordinaten (mm) aus der",
+        ";;  STEP-Datei -- die Annotationen landen am geladenen Modell direkt",
+        ";;  an der jeweiligen Bohrung.",
+        ";;",
+        ";;  >>> ANPASSUNG <<<",
+        ";;  Die eigentliche Platzierung steckt AUSSCHLIESSLICH in der Funktion",
+        ";;  HOLE-LABEL. Nutzt deine Creo-Elements/Direct-Version einen anderen",
+        ";;  Annotationsbefehl, muss NUR diese eine Funktion geaendert werden;",
+        ";;  die Datenzeilen darunter bleiben unveraendert.",
+        ";; ===================================================================",
+        "",
+        "(defun hole-label (num x y z size)",
+        "  ;; Erzeugt eine 3D-Notiz am Punkt (x y z) mit dem Text <num>.",
+        "  (sd-create-3d-note",
+        "      :text        num",
+        "      :position    (list x y z)",
+        "      :text-height size))",
+        "",
+        ";; --- Bohrungen -----------------------------------------------------",
+    ]
+    for f in sorted(features, key=lambda x: (x.type_no,)):
+        x, y, z = feature_annotation_point(f)
+        lines.append(f'(hole-label "{f.type_no}" '
+                     f'{fnum(x)} {fnum(y)} {fnum(z)} {fnum(size)})')
+    lines.append("")
+    return "\n".join(lines)
+
+
 def table_rows(features):
     """Bohrtabelle: je Typ eine Zeile mit Anzahl. Gewindetiefe ist nur bei
     Gewinden gesetzt (sonst None) — die tatsaechlich tragende Gewindelaenge,
