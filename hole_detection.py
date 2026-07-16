@@ -1920,79 +1920,69 @@ def analyze(shape_or_path, view="top", thread_map=None,
 
 
 # ----------------------------------------------------------------------------
-# LSP-Export (Creo Elements/Direct Modeling): Bohrnummern als 3D-Annotationen
+# LSP-Export (Creo Elements/Direct): Bohrnummern als 2D-Annotator-Text
 # ----------------------------------------------------------------------------
-def feature_annotation_point(f: Feature):
-    """Welt-3D-Punkt (x, y, z) am Bohrungseingang fuer die Beschriftung.
-    Verwendet das obere Ende (z1) der Bohrachse -- bei den ueblichen von
-    oben gebohrten Platten (Achse +Z) liegt die Beschriftung damit auf der
-    Deckflaeche am Bohrungseingang; bei Querbohrungen an der Austrittskante.
-    Die Koordinaten sind absolute Modellkoordinaten (wie in der STEP-Datei),
-    landen also beim Laden desselben Modells in Creo direkt an der Bohrung."""
-    d = f.axis_dir
-    base = _foot(f.axis_pt, d)
-    t = f.z1 - base
-    return (f.axis_pt[0] + t*d[0],
-            f.axis_pt[1] + t*d[1],
-            f.axis_pt[2] + t*d[2])
-
-
 def lsp_annotations(features, size=3.5):
-    """Erzeugt den Inhalt einer .lsp-Makrodatei fuer Creo Elements/Direct
-    Modeling, die an jeder Bohrung eine 3D-Text-Annotation mit der
-    Bohrnummer (f.type_no) anlegt. `size` ist die Texthoehe.
+    """Erzeugt den Inhalt einer .lsp-Datei, die in Creo Elements/Direct
+    Modeling geladen wird und im eingebetteten Annotator (Creo Elements/
+    Direct Drafting) an jeder Bohrung einen Text mit der Bohrnummer
+    (f.type_no) erzeugt.
 
-    Die tatsaechliche Platzierung ist in EINER Hilfsfunktion (hole-label)
-    gekapselt: falls die Creo-Version einen anderen Annotationsbefehl
-    verwendet, muss nur diese Funktion angepasst werden -- die erzeugten
-    Datenzeilen bleiben unveraendert."""
+    Als Position dient die 2D-Projektion der AKTUELLEN Ansicht (f.uv, in mm)
+    -- also genau die Lage, die im Schnittinator angezeigt wird. Ueber die
+    Variablen *scale* und *offset-x/-y* am Dateianfang wird auf die
+    Zeichenansicht abgebildet (Standard 1:1, Ursprung 0,0). Die Texthoehe
+    (*text-height*) ist in Zeichnungs-/Papiereinheiten und bleibt vom
+    Massstab unberuehrt.
+
+    Der eigentliche Text-Befehl steckt in EINER Hilfsfunktion (hole-label);
+    weicht der Befehl in deiner Version ab, muss nur diese Funktion
+    angepasst werden -- die Datenzeilen darunter bleiben unveraendert."""
     def fnum(x):
         return f"{x:.3f}".rstrip("0").rstrip(".")
 
     lines = [
         ";; ===================================================================",
-        ";;  Schnittinator - Bohrnummern-Annotationen",
+        ";;  Schnittinator - Bohrnummern-Annotationen (2D-Annotator / Drafting)",
         ";;  fuer Creo Elements/Direct Modeling (Lisp-Makro)",
         ";; ===================================================================",
-        ";;  Laden:  (load \"C:/pfad/zu/dieser/datei.lsp\")",
-        ";;          oder ueber  Datei -> Programmieren -> Laden",
+        ";;  Vorbereitung:  Zeichnung/Annotator mit der passenden Ansicht der",
+        ";;                 Platte oeffnen, dann diese Datei laden:",
+        ";;    (load \"C:/pfad/zu/dieser/datei.lsp\")",
+        ";;    oder ueber  Datei -> Programmieren -> Laden",
         ";;",
-        f";;  Legt an jeder Bohrung eine 3D-Notiz mit der Bohrnummer an.",
-        f";;  Texthoehe: {fnum(size)}",
+        ";;  Setzt im Annotator an jeder Bohrung einen Text mit der Bohrnummer.",
+        f";;  Texthoehe: {fnum(size)}  (Zeichnungseinheiten, massstabsunabhaengig)",
         ";;",
-        ";;  Koordinaten sind absolute Modellkoordinaten (mm) aus der",
-        ";;  STEP-Datei -- die Annotationen landen am geladenen Modell direkt",
-        ";;  an der jeweiligen Bohrung.",
-        ";;",
-        ";;  >>> ANPASSUNG <<<",
-        ";;  Die eigentliche Platzierung steckt AUSSCHLIESSLICH in der Funktion",
-        ";;  HOLE-LABEL. Der unten verwendete Befehl (sd-create-3d-note) ist",
-        ";;  ein Platzhalter -- je nach Creo-Version kann der Annotationsbefehl",
-        ";;  abweichen. So findest du den passenden Befehl heraus:",
-        ";;    1. Makro-Aufzeichnung starten",
-        ";;       (Datei -> Programmieren -> Makro aufzeichnen).",
-        ";;    2. EINE 3D-Notiz von Hand anlegen (3D-Dokumentation -> Notiz),",
-        ";;       Text z.B. \"1\" eingeben, Notiz platzieren.",
-        ";;    3. Aufzeichnung stoppen und die erzeugte .lsp-Datei ansehen --",
-        ";;       die dort aufgezeichneten Befehlszeilen zeigen den exakten",
-        ";;       Aufruf. Diesen in HOLE-LABEL (unten) uebernehmen; die",
-        ";;       hunderten Datenzeilen darunter bleiben unveraendert.",
+        ";;  Positionen sind die 2D-Projektion der im Schnittinator gewaehlten",
+        ";;  Ansicht (mm). Passe Massstab und Ursprung deiner Zeichenansicht an:",
         ";; ===================================================================",
         "",
-        "(defun hole-label (num x y z size)",
-        "  ;; Erzeugt eine 3D-Notiz am Punkt (x y z) mit dem Text <num>.",
-        "  ;; PLATZHALTER -- siehe Anpassungshinweis im Kopf der Datei.",
-        "  (sd-create-3d-note",
-        "      :text        num",
-        "      :position    (list x y z)",
-        "      :text-height size))",
+        f"(defvar *scale*       1.0)   ;; Zeichnungsmassstab (Modell:Zeichnung), z.B. 0.5 fuer 1:2",
+        f"(defvar *offset-x*    0.0)   ;; Ursprungsversatz X der Ansicht (Zeichnungseinheiten)",
+        f"(defvar *offset-y*    0.0)   ;; Ursprungsversatz Y der Ansicht (Zeichnungseinheiten)",
+        f"(defvar *text-height* {fnum(size)})",
         "",
-        ";; --- Bohrungen -----------------------------------------------------",
+        ";; >>> ANPASSUNG des Text-Befehls (falls noetig) <<<",
+        ";; hole-label rechnet Modell- in Zeichnungskoordinaten um und sendet",
+        ";; einen Drafting-TEXT-Befehl an den Annotator. Zeichnet deine Version",
+        ";; TEXT anders auf (Makro-Aufzeichnung im Annotator zeigt es), nur die",
+        ";; format-Zeile hier anpassen.",
+        "(defun hole-label (num u v)",
+        "  (let ((x (+ *offset-x* (* *scale* u)))",
+        "        (y (+ *offset-y* (* *scale* v))))",
+        "    (sd-execute-annotator-command",
+        "       (format nil \"TEXT '~A' ~A ~A\" num x y))))",
+        "",
+        ";; Texthoehe einmalig setzen (CHISIZE = Zeichenhoehe im Drafting):",
+        "(sd-execute-annotator-command",
+        "   (format nil \"CHISIZE ~A\" *text-height*))",
+        "",
+        ";; --- Bohrungen (Nr  u  v) ------------------------------------------",
     ]
     for f in sorted(features, key=lambda x: (x.type_no,)):
-        x, y, z = feature_annotation_point(f)
-        lines.append(f'(hole-label "{f.type_no}" '
-                     f'{fnum(x)} {fnum(y)} {fnum(z)} {fnum(size)})')
+        u, v = f.uv
+        lines.append(f'(hole-label "{f.type_no}" {fnum(u)} {fnum(v)})')
     lines.append("")
     return "\n".join(lines)
 

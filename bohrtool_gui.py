@@ -982,8 +982,9 @@ class App(tk.Tk):
 
     def export_lsp(self):
         """Bohrnummern als Creo-Elements/Direct-Lisp-Makro (.lsp) exportieren:
-        legt beim Ausfuehren in Creo an jeder Bohrung eine 3D-Annotation mit
-        der Bohrnummer an (Texthoehe 3.5)."""
+        setzt beim Laden im Annotator (2D-Zeichnung) an jeder Bohrung einen
+        Text mit der Bohrnummer an der Position der AKTUELLEN Ansicht
+        (Texthoehe 3.5)."""
         if self.result is None:
             return
         default = "bohrnummern.lsp"
@@ -1003,9 +1004,10 @@ class App(tk.Tk):
             fh.write(text)
         messagebox.showinfo(
             "Export",
-            f"LSP gespeichert:\n{path}\n\n{len(feats)} Bohrungen beschriftet "
-            "(Texthöhe 3.5).\n\nIn Creo Elements/Direct Modeling laden; passt "
-            "die Annotation nicht, nur die Funktion HOLE-LABEL in der Datei "
+            f"LSP gespeichert:\n{path}\n\n{len(feats)} Bohrungen (Ansicht "
+            f"'{self.view_var.get()}', Texthöhe 3.5).\n\nZeichnung/Annotator "
+            "mit dieser Ansicht öffnen, dann die Datei laden. Maßstab/Ursprung "
+            "der Ansicht ggf. oben in der Datei (*scale*, *offset-x/-y*) "
             "anpassen.")
 
     def export_fig(self, ext):
