@@ -999,16 +999,18 @@ class App(tk.Tk):
             return
         feats = [f for f in self.result["features"]
                  if hd.type_key(f) not in self.hidden_keys]
-        text = hd.lsp_annotations(feats, size=3.5)
+        bounds = self.result.get("bounds") or (0.0, 0.0, 0.0, 0.0)
+        text = hd.lsp_annotations(feats, bounds, size=3.5)
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(text)
         messagebox.showinfo(
             "Export",
             f"LSP gespeichert:\n{path}\n\n{len(feats)} Bohrungen (Ansicht "
             f"'{self.view_var.get()}', Texthöhe 3.5).\n\nZeichnung/Annotator "
-            "mit dieser Ansicht öffnen, dann die Datei laden. Maßstab/Ursprung "
-            "der Ansicht ggf. oben in der Datei (*scale*, *offset-x/-y*) "
-            "anpassen.")
+            "mit dieser Ansicht öffnen, dann die Datei laden. Zum Ausrichten "
+            "oben im File die Zeichnungs-Koordinaten der zwei Bauteil-Ecken "
+            "eintragen (Kalibrierung) — Maßstab/Versatz berechnet das Makro "
+            "dann selbst.")
 
     def export_fig(self, ext):
         if self.result is None:

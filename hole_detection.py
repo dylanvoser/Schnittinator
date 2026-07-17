@@ -1922,24 +1922,29 @@ def analyze(shape_or_path, view="top", thread_map=None,
 # ----------------------------------------------------------------------------
 # LSP-Export (Creo Elements/Direct): Bohrnummern als 2D-Annotator-Text
 # ----------------------------------------------------------------------------
-def lsp_annotations(features, size=3.5):
+def lsp_annotations(features, bounds, size=3.5):
     """Erzeugt den Inhalt einer .lsp-Datei, die in Creo Elements/Direct
     Modeling geladen wird und im eingebetteten Annotator (Creo Elements/
     Direct Drafting) an jeder Bohrung einen Text mit der Bohrnummer
     (f.type_no) erzeugt.
 
-    Als Position dient die 2D-Projektion der AKTUELLEN Ansicht (f.uv, in mm)
-    -- also genau die Lage, die im Schnittinator angezeigt wird. Ueber die
-    Variablen *scale* und *offset-x/-y* am Dateianfang wird auf die
-    Zeichenansicht abgebildet (Standard 1:1, Ursprung 0,0). Die Texthoehe
-    (*text-height*) ist in Zeichnungs-/Papiereinheiten und bleibt vom
-    Massstab unberuehrt.
+    Als Position dient die 2D-Projektion der AKTUELLEN Ansicht (f.uv, in mm).
+    Damit die Nummern zur ZEICHENANSICHT passen (die auf dem Blatt an
+    beliebiger Stelle und in beliebigem Massstab liegen kann), wird ueber
+    ZWEI Bezugsecken kalibriert: die Modellkoordinaten der Bauteil-
+    Bounding-Box-Ecken (bounds = (u0, v0, u1, v1)) stehen fest im File; der
+    Anwender traegt die ZEICHNUNGS-Koordinaten derselben zwei Ecken ein
+    (Cursor auf die Ecke, X/Y aus der Koordinatenanzeige ablesen). Das Makro
+    berechnet daraus Massstab UND Versatz je Achse automatisch -- keine
+    Vorabkenntnis des Zeichnungsmassstabs noetig.
 
     Der eigentliche Text-Befehl steckt in EINER Hilfsfunktion (hole-label);
     weicht der Befehl in deiner Version ab, muss nur diese Funktion
     angepasst werden -- die Datenzeilen darunter bleiben unveraendert."""
     def fnum(x):
         return f"{x:.3f}".rstrip("0").rstrip(".")
+
+    u0, v0, u1, v1 = bounds
 
     lines = [
         ";; ===================================================================",
@@ -1953,26 +1958,43 @@ def lsp_annotations(features, size=3.5):
         ";;",
         ";;  Setzt im Annotator an jeder Bohrung einen Text mit der Bohrnummer.",
         f";;  Texthoehe: {fnum(size)}  (Zeichnungseinheiten, massstabsunabhaengig)",
+        ";; ===================================================================",
         ";;",
-        ";;  Positionen sind die 2D-Projektion der im Schnittinator gewaehlten",
-        ";;  Ansicht (mm). Passe Massstab und Ursprung deiner Zeichenansicht an:",
+        ";;  >>> KALIBRIERUNG (einmalig pro Zeichnung) <<<",
+        ";;  Die Nummern werden ueber ZWEI Bauteil-Ecken auf deine Ansicht",
+        ";;  ausgerichtet. Die MODELL-Koordinaten der zwei Ecken stehen bereits",
+        ";;  unten fest. Trage die ZEICHNUNGS-Koordinaten DERSELBEN zwei Ecken",
+        ";;  ein: im Annotator den Cursor auf die jeweilige Ecke der Ansicht",
+        ";;  setzen und die angezeigten X/Y-Werte hier eintragen.",
+        ";;    Ecke 1 = untere-linke  Ecke der Bauteil-Bounding-Box",
+        ";;    Ecke 2 = obere-rechte  Ecke der Bauteil-Bounding-Box",
+        ";;  Solange beide Ecken-Paare identisch sind (Standard), landen die",
+        ";;  Nummern an den reinen Modellkoordinaten (1:1, Ursprung 0,0).",
         ";; ===================================================================",
         "",
-        f"(defvar *scale*       1.0)   ;; Zeichnungsmassstab (Modell:Zeichnung), z.B. 0.5 fuer 1:2",
-        f"(defvar *offset-x*    0.0)   ;; Ursprungsversatz X der Ansicht (Zeichnungseinheiten)",
-        f"(defvar *offset-y*    0.0)   ;; Ursprungsversatz Y der Ansicht (Zeichnungseinheiten)",
         f"(defvar *text-height* {fnum(size)})",
         "",
+        ";; feste Modell-Koordinaten der zwei Bezugsecken (nicht aendern):",
+        f"(defvar *model-c1-x* {fnum(u0)})  (defvar *model-c1-y* {fnum(v0)})",
+        f"(defvar *model-c2-x* {fnum(u1)})  (defvar *model-c2-y* {fnum(v1)})",
+        "",
+        ";; >>> HIER die Zeichnungs-Koordinaten der zwei Ecken eintragen: <<<",
+        f"(defvar *draw-c1-x* {fnum(u0)})  (defvar *draw-c1-y* {fnum(v0)})   ;; untere-linke Ecke",
+        f"(defvar *draw-c2-x* {fnum(u1)})  (defvar *draw-c2-y* {fnum(v1)})   ;; obere-rechte Ecke",
+        "",
+        ";; --- Transform (automatisch: Massstab + Versatz je Achse) ----------",
+        "(defvar *sx* (/ (- *draw-c2-x* *draw-c1-x*) (- *model-c2-x* *model-c1-x*)))",
+        "(defvar *sy* (/ (- *draw-c2-y* *draw-c1-y*) (- *model-c2-y* *model-c1-y*)))",
+        "(defun m->d-x (u) (+ *draw-c1-x* (* *sx* (- u *model-c1-x*))))",
+        "(defun m->d-y (v) (+ *draw-c1-y* (* *sy* (- v *model-c1-y*))))",
+        "",
         ";; >>> ANPASSUNG des Text-Befehls (falls noetig) <<<",
-        ";; hole-label rechnet Modell- in Zeichnungskoordinaten um und sendet",
-        ";; einen Drafting-TEXT-Befehl an den Annotator. Zeichnet deine Version",
-        ";; TEXT anders auf (Makro-Aufzeichnung im Annotator zeigt es), nur die",
-        ";; format-Zeile hier anpassen.",
+        ";; hole-label sendet einen Drafting-TEXT-Befehl an den Annotator.",
+        ";; Zeichnet deine Version TEXT anders auf, nur die format-Zeile hier",
+        ";; anpassen (bestaetigt: TEXT '<text>' x,y).",
         "(defun hole-label (num u v)",
-        "  (let ((x (+ *offset-x* (* *scale* u)))",
-        "        (y (+ *offset-y* (* *scale* v))))",
-        "    (sd-execute-annotator-command",
-        "       :cmd (format nil \"TEXT '~A' ~A,~A\" num x y))))",
+        "  (sd-execute-annotator-command",
+        "     :cmd (format nil \"TEXT '~A' ~A,~A\" num (m->d-x u) (m->d-y v))))",
         "",
         ";; Texthoehe einmalig setzen (CHISIZE = Zeichenhoehe im Drafting):",
         "(sd-execute-annotator-command",
