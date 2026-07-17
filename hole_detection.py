@@ -1972,11 +1972,11 @@ def lsp_annotations(features, size=3.5):
         "  (let ((x (+ *offset-x* (* *scale* u)))",
         "        (y (+ *offset-y* (* *scale* v))))",
         "    (sd-execute-annotator-command",
-        "       (format nil \"TEXT '~A' ~A ~A\" num x y))))",
+        "       :cmd (format nil \"TEXT '~A' ~A,~A\" num x y))))",
         "",
         ";; Texthoehe einmalig setzen (CHISIZE = Zeichenhoehe im Drafting):",
         "(sd-execute-annotator-command",
-        "   (format nil \"CHISIZE ~A\" *text-height*))",
+        "   :cmd (format nil \"CHISIZE ~A\" *text-height*))",
         "",
         ";; --- Bohrungen (Nr  u  v) ------------------------------------------",
     ]
