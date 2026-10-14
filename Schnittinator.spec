@@ -32,7 +32,13 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        # Programm nutzt tkinter, kein Qt. Die Spyder-Umgebung bringt aber
+        # PyQt5 UND PySide6 mit -> PyInstaller bricht sonst ab ("multiple
+        # Qt bindings packages").
+        'PyQt5', 'PyQt6', 'PySide2', 'PySide6', 'qtpy',
+        'IPython', 'jupyter_client', 'spyder', 'spyder_kernels',
+    ],
     noarchive=False,
     cipher=block_cipher,
 )
