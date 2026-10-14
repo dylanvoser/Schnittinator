@@ -36,6 +36,19 @@ from OCP.Bnd import Bnd_Box
 from OCP.BRepBndLib import BRepBndLib
 from OCP.gp import gp_Pnt, gp_Vec, gp_Dir
 
+
+def ocp_static(cls, name):
+    """Statische OCP-Methode versionsunabhaengig holen: OCP <= 7.9 haengt
+    ein '_s' an (TopoDS.Face_s), OCP >= 8.0 nicht mehr (TopoDS.Face)."""
+    return getattr(cls, name + "_s", None) or getattr(cls, name)
+
+
+def box_limits(box):
+    """(x0, y0, z0, x1, y1, z1) eines Bnd_Box - funktioniert mit OCP 7.x
+    (Get() liefert ein Tupel) und OCP 8.x (Get() liefert ein Struct)."""
+    p0, p1 = box.CornerMin(), box.CornerMax()
+    return p0.X(), p0.Y(), p0.Z(), p1.X(), p1.Y(), p1.Z()
+
 # ----------------------------------------------------------------------------
 # Toleranzen / Konstanten
 # ----------------------------------------------------------------------------
@@ -244,7 +257,7 @@ def collect_segments(shape):
     cyls, cones = [], []
     ex = TopExp_Explorer(shape, TopAbs_FACE)
     while ex.More():
-        face = TopoDS.Face_s(ex.Current())
+        face = ocp_static(TopoDS, "Face")(ex.Current())
         ad = BRepAdaptor_Surface(face)
         stype = ad.GetType()
         if stype in (GeomAbs_Cylinder, GeomAbs_Cone):
@@ -903,7 +916,9 @@ def plan_step_section(features, view="top", direction="horizontal",
                                   min(ta, tb) - infl_t, max(ta, tb) + infl_t))
 
     if not nodes:
-        return [], [], "Keine schnittbaren Bohrungen in dieser Ansicht."
+        # gleiche Rueckgabeform wie unten (poly, hits, text, score, soft)
+        return ([], [], "Keine schnittbaren Bohrungen in dieser Ansicht.",
+                (float("-inf"),), {})
 
     nodes.sort(key=lambda nd: (nd["s0"], nd["s1"]))
     n = len(nodes)
@@ -1804,8 +1819,8 @@ def plan_manual_section(selected, all_features, view="top",
 def bounds_uv(shape, view, rotation=0):
     """Bounding Box des Bauteils in Bildkoordinaten (u0, v0, u1, v1)."""
     box = Bnd_Box()
-    BRepBndLib.Add_s(shape, box)
-    x0, y0, z0, x1, y1, z1 = box.Get()
+    ocp_static(BRepBndLib, "Add")(shape, box)
+    x0, y0, z0, x1, y1, z1 = box_limits(box)
     ud, wd = effective_uv(view, rotation)
     us, vs = [], []
     for x in (x0, x1):
@@ -2075,19 +2090,19 @@ def outline_curves(shape, view, rotation=0, max_pts=60000):
     total = 0
     ex = TopExp_Explorer(shape, TopAbs_FACE)
     while ex.More():
-        face = TopoDS.Face_s(ex.Current())
+        face = ocp_static(TopoDS, "Face")(ex.Current())
         ad = BRepAdaptor_Surface(face)
         if ad.GetType() == GeomAbs_Plane:
             nrm = ad.Plane().Axis().Direction()
             if abs(nrm.X()*vd[0] + nrm.Y()*vd[1] + nrm.Z()*vd[2]) > 0.999:
                 try:
-                    wire = BRepTools.OuterWire_s(face)
+                    wire = ocp_static(BRepTools, "OuterWire")(face)
                 except Exception:
                     ex.Next()
                     continue
                 wex = TopExp_Explorer(wire, TopAbs_EDGE)
                 while wex.More():
-                    e = TopoDS.Edge_s(wex.Current())
+                    e = ocp_static(TopoDS, "Edge")(wex.Current())
                     try:
                         c = BRepAdaptor_Curve(e)
                         p0, p1 = c.FirstParameter(), c.LastParameter()

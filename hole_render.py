@@ -14,13 +14,35 @@ import math
 from matplotlib.patches import Circle, Arc, Rectangle, FancyArrow
 from matplotlib.lines import Line2D
 
-from hole_detection import VIEW_UV, VIEW_DIRS, feature_uv_extent, _dot, _norm
+from hole_detection import (VIEW_UV, VIEW_DIRS, feature_uv_extent, _dot, _norm,
+                            ocp_static, box_limits)
 
-COL_AXIAL = "#1a1a1a"
-COL_THREAD = "#0057b8"
-COL_CROSS = "#b30000"
-COL_SECTION = "#7a00a8"
-COL_SECTION2 = "#e07000"
+# Farben (abgestimmt auf das Programm-Icon: Blau, Violett, Orange)
+COL_AXIAL = "#1c2633"      # Bohrung axial
+COL_THREAD = "#1565c0"     # Gewinde
+COL_CROSS = "#c62828"      # Querbohrung
+COL_SECTION = "#6a3fc8"    # Schnitt A-A (automatisch)
+COL_SECTION2 = "#ef7d00"   # Schnitt B-B (manuell)
+COL_HILITE = "#14a05a"     # Markierung "hinspringen"
+COL_OUTLINE = "#3d4a5a"    # Aussenkontur
+COL_CENTER = "#9aa5b1"     # Mittellinien
+COL_FRAME = "#c3ccd6"      # Blattrahmen / Achsen
+COL_MUTED = "#5d6b7c"
+SHEET_BG = "#f3f5f8"       # Hintergrund um das Zeichenblatt
+
+
+def style_axes(ax):
+    """Ruhige, CAD-artige Blattoptik: weisses Blatt, feiner Rahmen,
+    gedaempfte Achsbeschriftung."""
+    ax.set_facecolor("#ffffff")
+    for sp in ax.spines.values():
+        sp.set_color(COL_FRAME)
+        sp.set_linewidth(0.8)
+    ax.tick_params(colors=COL_MUTED, labelsize=7.5, length=3, width=0.6)
+    ax.xaxis.label.set_color(COL_MUTED)
+    ax.yaxis.label.set_color(COL_MUTED)
+    ax.xaxis.label.set_size(8)
+    ax.yaxis.label.set_size(8)
 
 
 def outline_uv(shape, view):
@@ -28,8 +50,8 @@ def outline_uv(shape, view):
     from OCP.Bnd import Bnd_Box
     from OCP.BRepBndLib import BRepBndLib
     box = Bnd_Box()
-    BRepBndLib.Add_s(shape, box)
-    x0, y0, z0, x1, y1, z1 = box.Get()
+    ocp_static(BRepBndLib, "Add")(shape, box)
+    x0, y0, z0, x1, y1, z1 = box_limits(box)
     ud, wd = VIEW_UV[view]
     us, vs = [], []
     for x in (x0, x1):
@@ -53,12 +75,12 @@ def draw_coord_cross(ax, view, u0, v0, rotation=0):
     lv = AXIS_NAME.get(tuple(int(round(c)) for c in wd), "v")
     ox, oy, L = u0 - 14, v0 - 14, 12
     ax.add_patch(FancyArrow(ox, oy, L, 0, width=0.25, head_width=2.4,
-                            head_length=2.6, color="#333", zorder=6))
+                            head_length=2.6, color=COL_OUTLINE, zorder=6))
     ax.add_patch(FancyArrow(ox, oy, 0, L, width=0.25, head_width=2.4,
-                            head_length=2.6, color="#333", zorder=6))
-    ax.annotate(lu, (ox+L+3, oy), fontsize=9, color="#333",
+                            head_length=2.6, color=COL_OUTLINE, zorder=6))
+    ax.annotate(lu, (ox+L+3, oy), fontsize=9, color=COL_OUTLINE,
                 fontweight="bold", va="center")
-    ax.annotate(lv, (ox, oy+L+3), fontsize=9, color="#333",
+    ax.annotate(lv, (ox, oy+L+3), fontsize=9, color=COL_OUTLINE,
                 fontweight="bold", ha="center")
 
 
@@ -90,10 +112,10 @@ def draw_view(ax, result, view, show_section=True, hidden_types=frozenset()):
     outline = result.get("outline")
     if outline:
         for pts in outline:
-            add(pts, "#555555", 1.1)
+            add(pts, COL_OUTLINE, 1.2)
     else:
         add([(u0, v0), (u1, v0), (u1, v1), (u0, v1), (u0, v0)],
-            "#555555", 1.4)
+            COL_OUTLINE, 1.4)
 
     labels = []   # (x, y, text, color)
     for f in feats:
@@ -115,8 +137,8 @@ def draw_view(ax, result, view, show_section=True, hidden_types=frozenset()):
                     add(circle(u, v, r*1.8), COL_AXIAL, 0.7, "dotted")
                 lab_col = COL_AXIAL
             m = max(r*1.4, 3.0)
-            add([(u-m, v), (u+m, v)], "#888888", 0.5, (0, (8, 2, 1, 2)))
-            add([(u, v-m), (u, v+m)], "#888888", 0.5, (0, (8, 2, 1, 2)))
+            add([(u-m, v), (u+m, v)], COL_CENTER, 0.5, (0, (8, 2, 1, 2)))
+            add([(u, v-m), (u, v+m)], COL_CENTER, 0.5, (0, (8, 2, 1, 2)))
             if f.type_no not in hidden_types:
                 labels.append((u + m*0.75, v + m*0.75, str(f.type_no), lab_col))
         else:
@@ -146,7 +168,7 @@ def draw_view(ax, result, view, show_section=True, hidden_types=frozenset()):
     if show_section and poly:
         xs = [p[0] for p in poly]
         ys = [p[1] for p in poly]
-        ax.plot(xs, ys, color=COL_SECTION, lw=1.8, ls=(0, (12, 3, 2, 3)),
+        ax.plot(xs, ys, color=COL_SECTION, lw=2.0, ls=(0, (12, 3, 2, 3)),
                 alpha=0.9, zorder=4)
         for (px, py), (qx, qy), lab in ((poly[0], poly[1], "A"),
                                         (poly[-1], poly[-2], "A")):
@@ -167,7 +189,7 @@ def draw_view(ax, result, view, show_section=True, hidden_types=frozenset()):
     if show_section and len(poly2) >= 2:
         xs = [p[0] for p in poly2]
         ys = [p[1] for p in poly2]
-        ax.plot(xs, ys, color=COL_SECTION2, lw=1.8,
+        ax.plot(xs, ys, color=COL_SECTION2, lw=2.0,
                 ls=(0, (10, 3, 2, 3, 2, 3)), alpha=0.9, zorder=4)
         for (px, py), (qx, qy), lab in ((poly2[0], poly2[1], "B"),
                                         (poly2[-1], poly2[-2], "B")):
@@ -181,14 +203,16 @@ def draw_view(ax, result, view, show_section=True, hidden_types=frozenset()):
 
     draw_coord_cross(ax, view, u0, v0, rot)
 
+    style_axes(ax)
     ax.set_aspect("equal")
     ax.autoscale_view()
     ax.margins(0.10)
     ax.set_xlabel("u [mm]")
     ax.set_ylabel("v [mm]")
     dname = result.get("direction", "horizontal")
-    rtxt = f", {rot}° gedreht" if rot else ""
-    ax.set_title(f"Ansicht: {view}{rtxt}  —  Stufenschnitt A-A ({dname})")
+    rtxt = f"  ·  {rot}° gedreht" if rot else ""
+    ax.set_title(f"Ansicht {view}{rtxt}  ·  Stufenschnitt A-A {dname}",
+                 loc="left", fontsize=9, color=COL_MUTED, pad=8)
     handles = [
         Line2D([], [], color=COL_AXIAL, lw=1.4, label="Bohrung (axial)"),
         Line2D([], [], color=COL_THREAD, lw=1.4, label="Gewinde"),
@@ -198,4 +222,9 @@ def draw_view(ax, result, view, show_section=True, hidden_types=frozenset()):
     if poly2:
         handles.append(Line2D([], [], color=COL_SECTION2, lw=1.8, ls="-.",
                               label="Schnitt B-B (manuell)"))
-    ax.legend(handles=handles, loc="upper right", fontsize=7, framealpha=0.9)
+    leg = ax.legend(handles=handles, loc="upper right", fontsize=7,
+                    framealpha=0.95, fancybox=False, borderpad=0.6)
+    leg.get_frame().set_edgecolor(COL_FRAME)
+    leg.get_frame().set_linewidth(0.8)
+    for t in leg.get_texts():
+        t.set_color("#33404f")

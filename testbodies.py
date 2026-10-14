@@ -2,6 +2,7 @@
 """Synthetische STEP-Testkoerper mit BEKANNTER Zusammensetzung."""
 import math
 from OCP.gp import gp_Pnt, gp_Dir, gp_Ax2
+from hole_detection import ocp_static
 from OCP.BRepPrimAPI import (BRepPrimAPI_MakeBox, BRepPrimAPI_MakeCylinder,
                              BRepPrimAPI_MakeCone)
 from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
@@ -52,7 +53,7 @@ def make_mixed_plate(step_path=None, with_fillets=True):
         mk = BRepFilletAPI_MakeFillet(plate)
         ex = TopExp_Explorer(plate, TopAbs_EDGE)
         while ex.More():
-            e = TopoDS.Edge_s(ex.Current())
+            e = ocp_static(TopoDS, "Edge")(ex.Current())
             ad = BRepAdaptor_Curve(e)
             if ad.GetType() == GeomAbs_Line:
                 d = ad.Line().Direction()

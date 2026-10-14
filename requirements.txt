@@ -1,0 +1,6 @@
+# Laufzeit-Abhaengigkeiten des Schnittinator (getestet mit Python 3.12)
+# OCP 7.9 und 8.0 liefern identische Ergebnisse (siehe ocp_static/box_limits
+# in hole_detection.py); neuere Hauptversionen erst nach Test freigeben.
+cadquery-ocp-novtk>=7.8,<8.1
+matplotlib>=3.7
+numpy
