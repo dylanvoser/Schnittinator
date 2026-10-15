@@ -1852,79 +1852,246 @@ def analyze_geometry(shape_or_path, thread_map=None,
     }
 
 
+SECTION_LETTERS = "ABCDEF"      # Schnitt A-A, B-B, ... (max. 6 Schnitte)
+
+
+def _plan_auto(feats, view, direction, rotation, bnds, force_keys, skip_keys,
+               cache):
+    """Automatischen Stufenschnitt planen (je Richtung mit und ohne
+    Spiegelung, bestes Ergebnis). direction 'best' probiert horizontal UND
+    vertikal. Ergebnisse werden im (vom Aufrufer gehaltenen) cache-dict
+    zwischengespeichert. Rueckgabe: (richtung, poly, hits, raw_txt, score,
+    soft)."""
+    dirs = (["horizontal", "vertical"] if direction == "best"
+            else [direction])
+    ids = tuple(id(f) for f in feats)
+    best = None
+    for d in dirs:
+        key = (view, d, int(rotation) % 360, frozenset(force_keys),
+               frozenset(skip_keys), ids)
+        res = cache.get(key) if cache is not None else None
+        if res is None:
+            b = None
+            for mir in (False, True):
+                poly_, hits_, raw_, sc_, soft_ = plan_step_section(
+                    feats, view, d, bounds=bnds, rotation=rotation,
+                    _mirror=mir, force_keys=force_keys, skip_keys=skip_keys)
+                if b is None or sc_ > b[3]:
+                    b = (poly_, hits_, raw_, sc_, soft_)
+            res = b
+            if cache is not None:
+                if len(cache) > 48:
+                    cache.clear()
+                cache[key] = res
+        if best is None or res[3] > best[4]:
+            best = (d,) + tuple(res)
+    return best
+
+
+def _schneidbar(f):
+    return f.orientation in ("axial", "quer")
+
+
 def analyze_view(geo, view="top", direction="horizontal", rotation=0,
                  force_keys=frozenset(), skip_keys=frozenset(),
                  manual_selection=(), manual_direction="horizontal",
-                 renumber_source="A", section_cache=None):
+                 renumber_source="A", section_cache=None, cuts=None):
     """LEICHTE Phase: Orientierung/Projektion (inkl. Bilddrehung),
-    Stufenschnitt, manueller Zweitschnitt B-B, Nummerierung entlang des
-    gewaehlten Schnitts (renumber_source 'A' oder 'B'), Text, Aussenkontur.
-    manual_selection: Feature-Objekte aus geo['features'] fuer Schnitt B.
-    section_cache: optionales, vom Aufrufer gehaltenes dict — der teure
-    Stufenschnitt A-A (doppelte Planung mit/ohne Spiegelung) wird darin
-    zwischengespeichert und bei unveraenderten Eingaben (Ansicht, Richtung,
-    Drehung, Erzwingen-/Nicht-noetig-Markierungen, Bohrungsmenge)
-    wiederverwendet — wichtig, damit Schnitt-B-Aenderungen (Klick fuer
-    manuelle Bohrungsauswahl) nicht jedes Mal die komplette, aufwendige
-    Stufenschnitt-Optimierung neu durchlaufen."""
+    Stufenschnitte, Nummerierung, Text, Aussenkontur.
+
+    cuts: Liste der Schnitte in Reihenfolge A, B, C, ... — je Eintrag ein
+      dict {"mode": "auto"|"manual", "direction": "horizontal"|"vertical"|
+      "best", "selection": [Feature, ...] (nur manuell)}.
+      * Schnitt A ist der Hauptschnitt.
+      * Jeder weitere AUTOMATISCHE Schnitt zielt nur auf die Bohrungstypen,
+        die in den vorherigen Schnitten noch NICHT enthalten sind (bereits
+        geschnittene Typen gelten dort als 'nicht noetig' und duerfen
+        gekreuzt / angeschnitten werden).
+      * Manuelle Schnitte laufen durch die angeklickten Bohrungen.
+      Ohne cuts gilt das alte Verhalten: A automatisch (+ B manuell, falls
+      manual_selection gesetzt).
+    Nummerierung: Typen in Schnitt A bekommen 1..k in Schnittreihenfolge,
+    Typen, die erst in B neu dazukommen, zaehlen fortlaufend weiter (k+1..),
+    dann C usw.; Typen in keinem Schnitt zuletzt. (renumber_source wird nur
+    noch aus Kompatibilitaetsgruenden angenommen.)
+    section_cache: optionales, vom Aufrufer gehaltenes dict fuer die teuren
+    automatischen Stufenschnitte (wichtig, damit Klicks fuer manuelle
+    Schnitte nicht jedes Mal alles neu optimieren)."""
     feats = assign_type_numbers(geo["features"])
     feats = classify_view(feats, view, rotation)
     bnds = bounds_uv(geo["shape"], view, rotation)
+    if cuts is None:
+        cuts = [{"mode": "auto", "direction": direction}]
+        if manual_selection:
+            cuts.append({"mode": "manual", "direction": manual_direction,
+                         "selection": list(manual_selection)})
+    cuts = list(cuts)[:len(SECTION_LETTERS)]
+    live = set(id(f) for f in feats)
+    force_keys, skip_keys = frozenset(force_keys), frozenset(skip_keys)
 
-    cache_key = (view, direction, int(rotation) % 360,
-                frozenset(force_keys), frozenset(skip_keys),
-                tuple(id(f) for f in feats))
-    cached = section_cache.get(cache_key) if section_cache is not None \
-        else None
-    if cached is not None:
-        poly, hits, raw_txt, soft_sum = cached
-    else:
-        best = None
-        for mir in (False, True):
-            poly_, hits_, raw_, sc_, soft_ = plan_step_section(
-                feats, view, direction, bounds=bnds, rotation=rotation,
-                _mirror=mir, force_keys=force_keys, skip_keys=skip_keys)
-            if best is None or sc_ > best[3]:
-                best = (poly_, hits_, raw_, sc_, soft_)
-        poly, hits, raw_txt, _, soft_sum = best
-        if section_cache is not None:
-            section_cache.clear()   # nur die aktuelle Ansicht vorhalten
-            section_cache[cache_key] = (poly, hits, raw_txt, soft_sum)
+    covered_set = set()
+    sections = []
+    for i, c in enumerate(cuts):
+        letter = SECTION_LETTERS[i]
+        mode = c.get("mode", "auto")
+        req_dir = c.get("direction", "horizontal")
+        prior = frozenset(covered_set)
+        sec = {"letter": letter, "name": f"{letter}-{letter}", "mode": mode,
+               "requested_direction": req_dir, "prior_keys": prior,
+               "poly": [], "hits": [], "raw": "", "soft": {},
+               "force_keys": frozenset(), "skip_keys": skip_keys,
+               "empty_reason": None}
+        if mode == "auto":
+            f_k = force_keys - prior
+            s_k = skip_keys | prior
+            goals = {type_key(f) for f in feats if _schneidbar(f)} - s_k
+            if i > 0 and not goals:
+                sec["direction"] = req_dir if req_dir != "best" \
+                    else "horizontal"
+                sec["empty_reason"] = (
+                    "Alle schneidbaren Bohrungstypen sind bereits in "
+                    "frueheren Schnitten enthalten.")
+            else:
+                d, poly, hits, raw, _sc, soft = _plan_auto(
+                    feats, view, req_dir, rotation, bnds, f_k, s_k,
+                    section_cache)
+                sec.update(direction=d, poly=poly, hits=hits, raw=raw,
+                           soft=soft, force_keys=f_k)
+        else:
+            d = req_dir if req_dir in ("horizontal", "vertical") \
+                else "horizontal"
+            sel = [f for f in c.get("selection", ()) if id(f) in live]
+            poly, hits = plan_manual_section(sel, feats, view=view,
+                                             direction=d, rotation=rotation)
+            sec.update(direction=d, poly=poly, hits=hits)
+            if not sel:
+                sec["empty_reason"] = ("Noch keine Bohrung gewaehlt - "
+                                       "Bohrungen in der Zeichnung anklicken.")
+        new = []
+        for f in sec["hits"]:
+            k = type_key(f)
+            if k not in covered_set and k not in new:
+                new.append(k)
+        sec["new_keys"] = frozenset(new)
+        covered_set.update(new)
+        sections.append(sec)
 
-    poly2, hits2 = plan_manual_section(
-        list(manual_selection), feats, view=view,
-        direction=manual_direction, rotation=rotation) \
-        if manual_selection else ([], [])
+    mapping = renumber_by_section(feats, [f for sec in sections
+                                         for f in sec["hits"]])
+    texts = []
+    for sec in sections:
+        soft = {mapping.get(t, t): n for t, n in sec["soft"].items()}
+        sec["soft"] = soft
+        if sec["mode"] == "auto":
+            if sec["empty_reason"]:
+                txt = (f"Stufenschnitt {sec['name']} (automatisch): "
+                       + sec["empty_reason"])
+            else:
+                txt = build_section_text(
+                    feats, sec["poly"], sec["hits"], view, sec["direction"],
+                    warn=("WARNUNG" in sec["raw"]), rotation=rotation,
+                    soft=soft, force_keys=sec["force_keys"],
+                    skip_keys=skip_keys, name=sec["name"],
+                    prior_keys=sec["prior_keys"])
+        else:
+            txt = manual_section_text(feats, sec)
+        sec["text"] = txt
+        texts.append(txt)
+    texts.append(sections_summary(feats, sections, skip_keys))
+    section_txt = "\n\n".join(texts)
 
-    mapping = renumber_by_section(feats, hits2 if renumber_source == "B"
-                                  else hits)
-    soft_sum = {mapping.get(t, t): n for t, n in soft_sum.items()}
-    section_txt = build_section_text(feats, poly, hits, view, direction,
-                                     warn=("WARNUNG" in raw_txt),
-                                     rotation=rotation, soft=soft_sum,
-                                     force_keys=force_keys,
-                                     skip_keys=skip_keys)
     if "outline_cache" not in geo:
         geo["outline_cache"] = {}
     ck = (view, int(rotation) % 360)
     if ck not in geo["outline_cache"]:
         geo["outline_cache"][ck] = outline_curves(geo["shape"], view,
                                                   rotation)
+    first = sections[0]
+    second = next((x for x in sections[1:] if x["mode"] == "manual"), None)
     res = dict(geo)
     res.update({
         "view": view,
-        "direction": direction,
+        "direction": first["direction"],
         "rotation": int(rotation) % 360,
         "bounds": bnds,
         "outline": geo["outline_cache"][ck],
-        "section_poly": poly,
-        "section_hits": hits,
+        "sections": sections,
+        "section_poly": first["poly"],
+        "section_hits": first["hits"],
         "section_text": section_txt,
-        "section2_poly": poly2,
-        "section2_hits": hits2,
-        "renumber_source": renumber_source,
+        # Kompatibilitaet (aeltere Aufrufer): erster manueller Schnitt
+        "section2_poly": second["poly"] if second else [],
+        "section2_hits": second["hits"] if second else [],
+        "renumber_source": "A",
     })
     return res
+
+
+def _type_list(nums):
+    """[1,2,3,5,7,8] -> '1-3, 5, 7, 8'"""
+    nums = sorted(set(nums))
+    out, i = [], 0
+    while i < len(nums):
+        j = i
+        while j + 1 < len(nums) and nums[j + 1] == nums[j] + 1:
+            j += 1
+        out.append(str(nums[i]) if j == i else
+                   (f"{nums[i]}, {nums[j]}" if j == i + 1
+                    else f"{nums[i]}-{nums[j]}"))
+        i = j + 1
+    return ", ".join(out)
+
+
+def manual_section_text(features, sec):
+    name = sec["name"]
+    if not sec["poly"]:
+        return (f"Stufenschnitt {name} (manuell): "
+                + (sec.get("empty_reason") or "keine Bohrung ausgewaehlt."))
+    dname = ("horizontal (links -> rechts)" if sec["direction"] == "horizontal"
+             else "vertikal (unten -> oben)")
+    lines = [f"Stufenschnitt {name} (manuell), Richtung: {dname}"]
+    for i, (u, v) in enumerate(sec["poly"]):
+        lines.append(f"  P{i+1}: ({u:.1f}, {v:.1f})")
+    hits = sec["hits"]
+    lines.append("Geschnittene Bohrungen in Schnittreihenfolge: "
+                 + ", ".join(f"#{f.type_no}" for f in hits)
+                 + f"  ({len(hits)} Bohrungen, "
+                   f"{len(set(f.type_no for f in hits))} Typen)")
+    prior = sorted({f.type_no for f in hits
+                    if type_key(f) in sec["prior_keys"]})
+    if prior:
+        lines.append("Bereits in frueheren Schnitten (keine neue Nummer): "
+                     "Typ " + _type_list(prior))
+    return "\n".join(lines)
+
+
+def sections_summary(features, sections, skip_keys=frozenset()):
+    """Uebersicht: welche Typen kommen in welchem Schnitt neu dazu, welche
+    sind noch in keinem Schnitt."""
+    by_key = {}
+    for f in features:
+        by_key.setdefault(type_key(f), f.type_no)
+    lines = ["UEBERSICHT DER SCHNITTE (Bohrnummern fortlaufend: erst "
+             "Schnitt A, dann B, ...)"]
+    covered = set()
+    for sec in sections:
+        nums = [by_key[k] for k in sec["new_keys"] if k in by_key]
+        covered |= set(sec["new_keys"])
+        mode = "automatisch" if sec["mode"] == "auto" else "manuell"
+        lines.append(f"  Schnitt {sec['name']} ({mode}): "
+                     + (f"neu Typ {_type_list(nums)}" if nums
+                        else "keine neuen Typen"))
+    rest = sorted(n for k, n in by_key.items()
+                  if k not in covered and k not in skip_keys)
+    skipped = sorted(n for k, n in by_key.items()
+                     if k not in covered and k in skip_keys)
+    if rest:
+        lines.append(f"  Noch in keinem Schnitt: Typ {_type_list(rest)}")
+    else:
+        lines.append("  Alle Bohrungstypen sind in einem Schnitt enthalten.")
+    if skipped:
+        lines.append(f"  (Nicht noetig markiert: Typ {_type_list(skipped)})")
+    return "\n".join(lines)
 
 
 def analyze(shape_or_path, view="top", thread_map=None,
@@ -1997,7 +2164,8 @@ def renumber_by_section(features, hits):
 
 def build_section_text(features, poly, hits, view, direction, warn=False,
                        cluster_tol=1.0, rotation=0, soft=None,
-                       force_keys=frozenset(), skip_keys=frozenset()):
+                       force_keys=frozenset(), skip_keys=frozenset(),
+                       name="A-A", prior_keys=frozenset()):
     if not poly:
         return "Keine schnittbaren Bohrungen in dieser Ansicht."
     horiz = (direction == "horizontal")
@@ -2017,7 +2185,7 @@ def build_section_text(features, poly, hits, view, direction, warn=False,
         return cov, (s1 - s0)
     dname = ("horizontal (links -> rechts)" if horiz
              else "vertikal (unten -> oben)")
-    txt = [f"Stufenschnitt A-A, Richtung: {dname}",
+    txt = [f"Stufenschnitt {name} (automatisch), Richtung: {dname}",
            "Verlauf (u=Bild-x, v=Bild-y), monoton, Knicke ausserhalb der "
            "Bohrungen:"]
     for i, (u, v) in enumerate(poly):
@@ -2054,6 +2222,10 @@ def build_section_text(features, poly, hits, view, direction, warn=False,
                                in sorted(soft.items())))
     skip_t = set(f.type_no for f in features if type_key(f) in skip_keys)
     force_t = set(f.type_no for f in features if type_key(f) in force_keys)
+    prior_t = set(f.type_no for f in features if type_key(f) in prior_keys)
+    if prior_t & hit_t:
+        txt.append("Bereits in frueheren Schnitten (keine neue Nummer): Typ "
+                   + _type_list(prior_t & hit_t))
     if force_t:
         ok_f = sorted(force_t & hit_t)
         bad_f = sorted(force_t - hit_t)
@@ -2066,9 +2238,10 @@ def build_section_text(features, poly, hits, view, direction, warn=False,
     if skip_t:
         txt.append("Als 'nicht noetig' markiert: Typ "
                    + ", ".join(map(str, sorted(skip_t))))
-    miss = sorted(reach_t - hit_t - skip_t)
+    miss = sorted(reach_t - hit_t - skip_t - prior_t)
     if miss:
-        txt.append("Nicht schneidbar ohne Regelverletzung (Umgebung zu "
+        txt.append(f"In {name} nicht schneidbar ohne Regelverletzung "
+                   "(ggf. weiteren Schnitt hinzufuegen; Umgebung zu "
                    "dicht / jede Zufahrt wuerde Nachbarbohrungen "
                    "aussermittig anschneiden): Typ "
                    + ", ".join(str(m) for m in miss))

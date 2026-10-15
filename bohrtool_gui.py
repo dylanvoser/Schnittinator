@@ -1,20 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-bohrtool_gui.py — Schnittinator: Bohrungserkennung aus STEP (GUI, v3.0)
+bohrtool_gui.py — Schnittinator: Bohrungserkennung aus STEP (GUI, v3.1)
 
-Start:  python bohrtool_gui.py
+Start:  python bohrtool_gui.py          (oder STEP-Datei auf das Fenster /
+                                          die EXE ziehen)
 
 Layout (alle Bereiche an den Trennstegen verstellbar, Seitenleisten
 einklappbar):
   links  : Bohrtabelle (Typen) + Schnittführung
   Mitte  : Zeichnung mit eigener Werkzeugleiste
-  rechts : Bohrungen im Schnitt — Schnitt A (automatisch) und
-           Schnitt B (manuell) als Tabellen nebeneinander
+  rechts : Schnitte A, B, C … als Tabellen nebeneinander. Weitere Schnitte
+           per „+ Automatisch“ (schneidet die noch fehlenden Bohrungstypen)
+           oder „+ Manuell“ (Bohrungen in der Zeichnung anklicken).
+           Bohrnummern laufen fortlaufend: erst Schnitt A, dann B, …
 
 Bedienung Grafik:
   Mausrad            = Zoom um den Cursor
   Rechte Maustaste   = Ansicht verschieben
-  Linke Maustaste    = Bohrung anklicken -> für Schnitt B (manuell) auswählen/abwählen
+  Linke Maustaste    = Bohrung anklicken -> zum aktiven manuellen Schnitt
+                       hinzufügen / entfernen (legt bei Bedarf einen an)
   ⌂ / Taste F        = Gesamtansicht, Markierung wird entfernt
   ◀ ▶ / Alt+←/→      = zwischen letzten Ansichten wechseln
 Tastenkürzel: Strg+O öffnen, Strg+S Einstellungen sichern, Strg+E PNG,
@@ -42,8 +46,26 @@ from matplotlib.backends.backend_tkagg import (FigureCanvasTkAgg,
 import hole_detection as hd
 import hole_render as hr
 
-APP_VERSION = "3.0"
+# Drag & Drop (optional): Paket tkinterdnd2. Fehlt es, laeuft das Programm
+# normal weiter, nur ohne Drag & Drop.
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+    _DnDBase = TkinterDnD.DnDWrapper
+except Exception:                       # pragma: no cover
+    TkinterDnD = None
+    DND_FILES = None
+
+    class _DnDBase:
+        pass
+
+APP_VERSION = "3.1"
 VIEWS = ["top", "bottom", "front", "back", "left", "right"]
+MAX_CUTS = len(hd.SECTION_LETTERS)
+DIR_LABEL = {"best": "beste Richtung", "horizontal": "horizontal",
+             "vertical": "vertikal"}
+DIR_VALUE = {v: k for k, v in DIR_LABEL.items()}
+DIR_VALUE.update({"horizontal": "horizontal", "vertical": "vertical",
+                  "best": "best"})
 
 # ------------------------------------------------------------------ Farben
 # Ruhige Grautöne, EINE Akzentfarbe (Blau aus dem Programm-Icon); Violett /
@@ -163,9 +185,16 @@ class NavToolbar(NavigationToolbar2Tk):
             pass
 
 
-class App(tk.Tk):
+class App(tk.Tk, _DnDBase):
     def __init__(self):
         super().__init__()
+        self._dnd_ok = False
+        if TkinterDnD is not None:
+            try:
+                TkinterDnD._require(self)
+                self._dnd_ok = True
+            except Exception:
+                self._dnd_ok = False
         self.title(f"Schnittinator {APP_VERSION}")
         self.configure(bg=C["bg"])
         # Pixel-Faktor fuer hohe DPI (1.0 bei 100 % Windows-Skalierung)
@@ -189,10 +218,16 @@ class App(tk.Tk):
         self.hidden_keys = set()
         self.deleted_keys = set()
         self._delete_stack = []
-        self.manual_selection = []       # Feature-Objekte fuer Schnitt B
-        self._section_cache = {}         # teurer Stufenschnitt A-A, s. hd.analyze_view
-        self._section_feats = []
-        self._section2_feats = []
+        self._section_cache = {}         # teure Stufenschnitte, s. hd.analyze_view
+        # Schnitte A, B, C …: je {"mode": "auto"|"manual", "dir": StringVar
+        # (Anzeigetext), "selection": [Feature, …] (nur manuell)}
+        self.dir_var = tk.StringVar(value=DIR_LABEL.get(
+            self._ui.get("direction", "horizontal"), "horizontal"))
+        self.cuts = [{"mode": "auto", "dir": self.dir_var, "selection": []}]
+        self._active_cut = None          # Index des manuellen Schnitts fuer Klicks
+        self._cut_cols = []
+        self._cut_letter_by_key = {}
+        self._refresh_again = False
         self._hl_artist = None
         self._pan_start = None
         self._last_scroll = 0.0
@@ -201,6 +236,7 @@ class App(tk.Tk):
         self._pending_import = None      # s. import_settings/_apply_pending_import
 
         self._build_ui()
+        self._setup_dnd()
         self._bind_shortcuts()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(60, self._restore_panes)
@@ -263,8 +299,7 @@ class App(tk.Tk):
             "left_split": self._safe_sash(self.left_pw, 0),
             "view": self.view_var.get(),
             "rotation": self.rot_var.get(),
-            "direction": self.dir_var.get(),
-            "manual_direction": self.dir2_var.get(),
+            "direction": DIR_VALUE.get(self.dir_var.get(), "horizontal"),
             "last_dir": self._ui.get("last_dir"),
         }
         path = _ui_state_path()
@@ -577,11 +612,6 @@ class App(tk.Tk):
         self.rot_var = tk.StringVar(value=self._ui.get("rotation", "0°"))
         combo("DREHUNG", self.rot_var, ["0°", "90°", "180°", "270°"], 5,
               self.refresh_view, "Ansicht in der Bildebene drehen")
-        self.dir_var = tk.StringVar(value=self._ui.get("direction",
-                                                       "horizontal"))
-        combo("SCHNITT A", self.dir_var, ["horizontal", "vertical"], 10,
-              self.refresh_view,
-              "Hauptrichtung des automatischen Stufenschnitts A-A")
         self._sep(bar)
 
         # "Gewinde nur mit Ansenkfase": im GUI ausgeblendet (siehe
@@ -600,7 +630,7 @@ class App(tk.Tk):
         # Seitenleisten ein/aus (rechts in der Leiste)
         self._left_visible = bool(self._ui.get("left_visible", True))
         self._right_visible = bool(self._ui.get("right_visible", True))
-        self.btn_right = ttk.Button(bar, text="Bohrungen im Schnitt ▸",
+        self.btn_right = ttk.Button(bar, text="Schnitte ▸",
                                     command=self.toggle_right)
         self.btn_right.pack(side="right")
         Tooltip(self.btn_right, "Rechte Seitenleiste ein/aus  (Strg+2)")
@@ -656,24 +686,33 @@ class App(tk.Tk):
         self.left_pw.add(card, weight=3)
 
         cols = ("Nr", "DGewinde", "Art", "Tiefe", "Gewindetiefe", "Anzahl",
-                "👁")
+                "Schnitt", "👁")
         headings = {"Nr": "Nr", "DGewinde": "Ø / Gew.", "Art": "Art",
                     "Tiefe": "Tiefe", "Gewindetiefe": "Gew.-T.",
-                    "Anzahl": "Anz.", "👁": "👁"}
-        widths = {"Nr": 30, "DGewinde": 64, "Art": 128, "Tiefe": 42,
-                  "Gewindetiefe": 50, "Anzahl": 38, "👁": 28}
+                    "Anzahl": "Anz.", "Schnitt": "Schnitt", "👁": "👁"}
+        widths = {"Nr": 30, "DGewinde": 62, "Art": 116, "Tiefe": 40,
+                  "Gewindetiefe": 48, "Anzahl": 36, "Schnitt": 54, "👁": 28}
         # Knoepfe zuerst (unten) packen -> werden bei wenig Hoehe nie
         # abgeschnitten, die Tabelle schrumpft stattdessen
         acts = tk.Frame(body, bg=C["panel"])
         acts.pack(side="bottom", fill="x", pady=(p(8), 0))
-        tk.Label(body, text="Zeile anklicken = zur Bohrung springen  ·  "
-                            "👁 = Nummer ein/aus", bg=C["panel"],
+        tk.Label(body, text="Zeile = hinspringen  ·  👁 = Nummer ein/aus",
+                 bg=C["panel"],
                  fg=C["muted"], font=(FONT, 8), anchor="w")\
             .pack(side="bottom", fill="x", pady=(p(4), 0))
         wrap, self.tree = self._tree(body, cols, headings, widths,
                                      anchors={"Art": "w"}, height=6)
         wrap.pack(side="top", fill="both", expand=True)
         self.tree.heading("👁", command=self._toggle_all_labels)
+
+        def fit_art(ev, cols=cols, widths=widths):
+            # "Art" nimmt den Rest der Breite -> alle anderen Spalten (inkl.
+            # Schnitt und 👁) bleiben immer sichtbar
+            fixed = sum(self.px(widths[c]) for c in cols if c != "Art")
+            self.tree.column("Art", width=max(self.px(56), ev.width - fixed))
+        self.tree.bind("<Configure>", fit_art, add="+")
+        Tooltip(wrap, "Spalte „Schnitt“: in welchem Schnitt der Bohrungstyp "
+                      "zuerst vorkommt\n(– = noch in keinem Schnitt)")
         self._eye_col_id = f"#{len(cols)}"
         self.tree.bind("<<TreeviewSelect>>", self._on_tree_click)
         self.tree.bind("<Button-1>", self._on_tree_button1)
@@ -724,8 +763,10 @@ class App(tk.Tk):
         foot = tk.Frame(body, bg=C["panel"])
         foot.pack(side="bottom", fill="x", pady=(p(6), 0))
         tk.Label(foot, text="Mausrad: Zoom  ·  Rechte Maustaste: verschieben"
-                            "  ·  Linksklick auf Bohrung: für Schnitt B "
-                            "wählen / abwählen", bg=C["panel"],
+                            "  ·  Linksklick auf Bohrung: in manuellen "
+                            "Schnitt aufnehmen / entfernen"
+                            + ("  ·  STEP-Datei hierher ziehen = öffnen"
+                               if self._dnd_ok else ""), bg=C["panel"],
                  fg=C["muted"], font=(FONT, 8), anchor="w")\
             .pack(side="left")
 
@@ -752,6 +793,10 @@ class App(tk.Tk):
         w.configure(highlightthickness=0, bd=0, bg=hr.SHEET_BG)
         w.pack(side="top", fill="both", expand=True)
         self.toolbar = NavToolbar(self.canvas, body, self)
+        self._drop_overlay = tk.Label(
+            self.center_pane, text="📂   STEP-Datei hier loslassen",
+            bg=C["accent"], fg="#ffffff", font=(FONT_SEMI, 14),
+            padx=p(28), pady=p(18))
         self._draw_placeholder()
 
         self.canvas.mpl_connect("scroll_event", self._on_scroll)
@@ -767,7 +812,9 @@ class App(tk.Tk):
         self.ax.text(0.5, 0.54, "Keine Datei geladen",
                      transform=self.ax.transAxes, ha="center", va="center",
                      fontsize=14, color="#5d6b7c")
-        self.ax.text(0.5, 0.46, "STEP laden…  oder  Strg+O",
+        self.ax.text(0.5, 0.46,
+                     ("STEP-Datei hierher ziehen  ·  STEP laden…  ·  Strg+O"
+                      if self._dnd_ok else "STEP laden…  oder  Strg+O"),
                      transform=self.ax.transAxes, ha="center", va="center",
                      fontsize=10, color="#8a97a6")
         self.fig.tight_layout()
@@ -777,97 +824,247 @@ class App(tk.Tk):
     def _build_right(self):
         p = self.px
         self.right_pane = ttk.Frame(self.main)
-        card, head, body = self._card(self.right_pane, "Bohrungen im Schnitt",
-                                      subtitle="A = automatisch · "
-                                               "B = manuell")
+        card, head, body = self._card(self.right_pane, "Schnitte")
         card.pack(fill="both", expand=True)
 
-        cols = ("Nr", "Bez", "Art", "Lage")
-        headings = {"Nr": "Nr", "Bez": "Ø / Gew.", "Art": "Art",
-                    "Lage": "Lage"}
-        widths = {"Nr": 28, "Bez": 54, "Art": 42, "Lage": 46}
+        self.btn_add_manual = ttk.Button(head, text="+ Manuell",
+                                         command=lambda: self.add_cut("manual"))
+        self.btn_add_manual.pack(side="right")
+        Tooltip(self.btn_add_manual,
+                "Weiteren MANUELLEN Schnitt anlegen:\n"
+                "danach Bohrungen in der Zeichnung anklicken")
+        self.btn_add_auto = ttk.Button(head, text="+ Automatisch",
+                                       style="Accent.TButton",
+                                       command=lambda: self.add_cut("auto"))
+        self.btn_add_auto.pack(side="right", padx=(0, p(6)))
+        Tooltip(self.btn_add_auto,
+                "Weiteren AUTOMATISCHEN Schnitt anlegen: schneidet die\n"
+                "Bohrungstypen, die in den bisherigen Schnitten fehlen")
 
-        tables = tk.Frame(body, bg=C["panel"])
-        tables.pack(fill="both", expand=True)
-        tables.columnconfigure((0, 1), weight=1, uniform="t")
-        tables.rowconfigure(1, weight=1)
+        tk.Label(body, text="Bohrnummern fortlaufend: erst Schnitt A, dann B, "
+                            "…  ·  grau = schon in früherem Schnitt  ·  "
+                            "Klick = hinspringen", bg=C["panel"],
+                 fg=C["muted"], font=(FONT, 8), anchor="w", justify="left",
+                 wraplength=p(400))\
+            .pack(side="bottom", fill="x", pady=(p(6), 0))
 
-        def col_head(col, title, color, badge_attr):
-            h = tk.Frame(tables, bg=C["panel"])
-            h.grid(row=0, column=col, sticky="ew",
-                   padx=(0 if col == 0 else p(4), p(4) if col == 0 else 0),
-                   pady=(0, p(4)))
-            tk.Frame(h, bg=color, height=p(3)).pack(fill="x", pady=(0, p(4)))
-            tk.Label(h, text=title, bg=C["panel"], fg=color,
-                     font=(FONT_SEMI, 9)).pack(side="left")
-            lb = tk.Label(h, text="0", bg=C["panel_alt"], fg=C["muted"],
-                          font=(FONT_SEMI, 8), padx=p(6))
-            lb.pack(side="right")
-            setattr(self, badge_attr, lb)
+        wrap = tk.Frame(body, bg=C["panel"])
+        wrap.pack(fill="both", expand=True)
+        self._cut_canvas = tk.Canvas(wrap, bg=C["panel"], highlightthickness=0,
+                                     bd=0)
+        self._cut_hsb = ttk.Scrollbar(wrap, orient="horizontal",
+                                      command=self._cut_canvas.xview)
+        self._cut_canvas.configure(xscrollcommand=self._cut_hsb.set)
+        self._cut_canvas.pack(side="top", fill="both", expand=True)
+        self._cut_inner = tk.Frame(self._cut_canvas, bg=C["panel"])
+        self._cut_win = self._cut_canvas.create_window(
+            0, 0, window=self._cut_inner, anchor="nw")
 
-        col_head(0, "Schnitt A", C["sec_a"], "lbl_badge_a")
-        col_head(1, "Schnitt B", C["sec_b"], "lbl_badge_b")
+        def on_canvas(ev):
+            self._cut_canvas.itemconfigure(self._cut_win, height=ev.height)
+            self._update_cut_scroll()
+        self._cut_canvas.bind("<Configure>", on_canvas)
+        self._cut_inner.bind("<Configure>",
+                             lambda e: self._update_cut_scroll())
+        self._rebuild_cut_columns()
 
-        wa, self.tv_secA = self._tree(tables, cols, headings, widths,
-                                      anchors={"Lage": "w"}, height=12)
-        wa.grid(row=1, column=0, sticky="nsew", padx=(0, p(4)))
-        wb, self.tv_secB = self._tree(tables, cols, headings, widths,
-                                      anchors={"Lage": "w"}, height=12)
-        wb.grid(row=1, column=1, sticky="nsew", padx=(p(4), 0))
-        self.tv_secA.bind("<<TreeviewSelect>>", self._on_sectionA_click)
-        self.tv_secB.bind("<<TreeviewSelect>>", self._on_sectionB_click)
+    def _update_cut_scroll(self):
+        c = self._cut_canvas
+        need_w = self._cut_inner.winfo_reqwidth()
+        cw = c.winfo_width()
+        if cw < 20:
+            return
+        # bis ~30 px zu breit: Spalten leicht stauchen statt scrollen
+        need = need_w > cw + self.px(30)
+        w = need_w if need else cw
+        c.itemconfigure(self._cut_win, width=w)
+        c.configure(scrollregion=(0, 0, w, c.winfo_height()))
+        shown = bool(self._cut_hsb.winfo_manager())
+        if need and not shown:
+            self._cut_hsb.pack(side="bottom", fill="x", before=c)
+        elif not need and shown:
+            self._cut_hsb.pack_forget()
+            c.xview_moveto(0)
 
-        # Steuerung Schnitt A (Hinweis) / Schnitt B (Richtung, Entfernen …)
-        ctrl_a = tk.Frame(tables, bg=C["panel"])
-        ctrl_a.grid(row=2, column=0, sticky="new", padx=(0, p(4)),
-                    pady=(p(8), 0))
-        tk.Label(ctrl_a, text="Klick = hinspringen.\nRichtung: „Schnitt A“ "
-                              "oben.", bg=C["panel"],
-                 fg=C["muted"], font=(FONT, 8), justify="left")\
-            .pack(anchor="w")
+    # ------------------------------------------------- Schnitt-Spalten
+    def _rebuild_cut_columns(self, scroll_end=False):
+        for w in self._cut_inner.winfo_children():
+            w.destroy()
+        for i in range(MAX_CUTS + 1):
+            self._cut_inner.columnconfigure(i, weight=0, minsize=0,
+                                            uniform="")
+        self._cut_cols = []
+        for i in range(len(self.cuts)):
+            self._build_cut_column(i)
+            self._cut_inner.columnconfigure(i, weight=1, uniform="cut",
+                                            minsize=self.px(190))
+        self._cut_inner.rowconfigure(0, weight=1)
+        full = len(self.cuts) >= MAX_CUTS
+        for b in (self.btn_add_auto, self.btn_add_manual):
+            b.state(["disabled"] if full else ["!disabled"])
+        if self._active_cut is not None and (
+                self._active_cut >= len(self.cuts)
+                or self.cuts[self._active_cut]["mode"] != "manual"):
+            self._active_cut = None
+        self._style_active_cut()
+        if self._dnd_ok:
+            self._dnd_register(self._cut_inner)
+        if self.result is not None and self.result.get("sections"):
+            self._update_section_lists()
+        self.after_idle(self._update_cut_scroll)
+        if scroll_end:
+            self.after(120, self._scroll_cuts_end)
 
-        ctrl_b = tk.Frame(tables, bg=C["panel"])
-        ctrl_b.grid(row=2, column=1, sticky="new", padx=(p(4), 0),
-                    pady=(p(8), 0))
-        rowd = tk.Frame(ctrl_b, bg=C["panel"])
-        rowd.pack(fill="x")
+    def _scroll_cuts_end(self):
+        """Neuesten Schnitt sichtbar machen."""
+        self.update_idletasks()
+        self._update_cut_scroll()
+        self._cut_canvas.xview_moveto(1.0)
+
+    def _build_cut_column(self, i):
+        p = self.px
+        cut = self.cuts[i]
+        col = hr.section_color(i)
+        letter = hd.SECTION_LETTERS[i]
+        manual = cut["mode"] == "manual"
+        outer = tk.Frame(self._cut_inner, bg=C["border"])
+        outer.grid(row=0, column=i, sticky="nsew",
+                   padx=(0 if i == 0 else p(6), 0))
+        fr = tk.Frame(outer, bg=C["panel"])
+        fr.pack(fill="both", expand=True, padx=1, pady=1)
+        tk.Frame(fr, bg=col, height=p(4)).pack(fill="x")
+
+        hrow = tk.Frame(fr, bg=C["panel"])
+        hrow.pack(fill="x", padx=p(8), pady=(p(6), 0))
+        tk.Label(hrow, text=f"Schnitt {letter}-{letter}", bg=C["panel"],
+                 fg=col, font=(FONT_SEMI, 10)).pack(side="left")
+        tk.Label(hrow, text=("manuell" if manual else "auto"),
+                 bg=C["panel_alt"], fg=C["muted"], font=(FONT, 8),
+                 padx=p(5)).pack(side="left", padx=(p(6), 0))
+        if i > 0:
+            bx = ttk.Button(hrow, text="✕", style="Icon.TButton", width=2,
+                            command=lambda i=i: self.remove_cut(i))
+            bx.pack(side="right")
+            Tooltip(bx, f"Schnitt {letter}-{letter} entfernen")
+        badge = tk.Label(fr, text="—", bg=C["panel"], fg=C["muted"],
+                         font=(FONT, 8), anchor="w", justify="left",
+                         wraplength=p(170))
+        badge.pack(fill="x", padx=p(8), pady=(p(2), p(4)))
+
+        rowd = tk.Frame(fr, bg=C["panel"])
+        rowd.pack(fill="x", padx=p(8), pady=(0, p(6)))
         tk.Label(rowd, text="Richtung", bg=C["panel"], fg=C["muted"],
                  font=(FONT, 8)).pack(side="left")
-        self.dir2_var = tk.StringVar(value=self._ui.get("manual_direction",
-                                                        "horizontal"))
-        cb2 = ttk.Combobox(rowd, textvariable=self.dir2_var,
-                           values=["horizontal", "vertical"], width=10,
-                           state="readonly")
-        cb2.pack(side="right")
-        cb2.bind("<<ComboboxSelected>>", lambda e: self._quick_refresh())
-        Tooltip(cb2, "Hauptrichtung des manuellen Schnitts B-B")
-        rowbtn = tk.Frame(ctrl_b, bg=C["panel"])
-        rowbtn.pack(fill="x", pady=(p(6), 0))
-        rowbtn.columnconfigure((0, 1), weight=1, uniform="b")
-        bb = ttk.Button(rowbtn, text="✕ Entfernen", style="Small.TButton",
-                        command=self._remove_selected_manual)
-        bb.grid(row=0, column=0, sticky="ew", padx=(0, p(2)))
-        Tooltip(bb, "Markierte Bohrung aus Schnitt B entfernen")
-        bb = ttk.Button(rowbtn, text="↺ Leeren", style="Small.TButton",
-                        command=self._reset_manual_section)
-        bb.grid(row=0, column=1, sticky="ew", padx=(p(2), 0))
-        Tooltip(bb, "Schnitt B komplett zurücksetzen")
+        values = (["horizontal", "vertikal"] if manual else
+                  ["beste Richtung", "horizontal", "vertikal"])
+        if cut["dir"].get() not in values:
+            cut["dir"].set(values[0])
+        cb = ttk.Combobox(rowd, textvariable=cut["dir"], values=values,
+                          width=13, state="readonly")
+        cb.pack(side="right")
+        cb.bind("<<ComboboxSelected>>", lambda e, i=i: self._on_cut_dir(i))
+        Tooltip(cb, "Hauptrichtung dieses Schnitts" + (
+            "" if manual else "\n„beste Richtung“ probiert beide und "
+                              "nimmt die bessere"))
 
-        # gemeinsame Option: Nummerierung
-        tk.Frame(body, bg=C["border"], height=1).pack(fill="x",
-                                                       pady=(p(10), p(8)))
-        rown = tk.Frame(body, bg=C["panel"])
-        rown.pack(fill="x")
-        tk.Label(rown, text="Bohrnummern fortlaufend entlang", bg=C["panel"],
-                 fg=C["muted"], font=(FONT, 8)).pack(side="left")
-        self.renumber_var = tk.StringVar(value="Schnitt A")
-        cbN = ttk.Combobox(rown, textvariable=self.renumber_var,
-                           values=["Schnitt A", "Schnitt B"], width=10,
-                           state="readonly")
-        cbN.pack(side="right")
-        cbN.bind("<<ComboboxSelected>>", lambda e: self._quick_refresh())
-        Tooltip(cbN, "Nr. 1 = erste Bohrung im gewählten Schnitt,\n"
-                     "danach aufsteigend in Schnittreihenfolge")
+        cols = ("Nr", "Bez", "Art", "Lage")
+        headings = {"Nr": "Nr", "Bez": "Ø / Gew", "Art": "Art",
+                    "Lage": "Lage"}
+        widths = {"Nr": 26, "Bez": 50, "Art": 40, "Lage": 40}
+        wrap, tv = self._tree(fr, cols, headings, widths,
+                              anchors={"Lage": "w"}, height=8)
+        if manual:
+            rowb = tk.Frame(fr, bg=C["panel"])
+            rowb.pack(side="bottom", fill="x", padx=p(8), pady=p(8))
+            rowb.columnconfigure((0, 1), weight=1, uniform="b")
+            b1 = ttk.Button(rowb, text="✕ Entfernen", style="Small.TButton",
+                            command=lambda i=i: self._remove_selected_manual(i))
+            b1.grid(row=0, column=0, sticky="ew", padx=(0, p(2)))
+            Tooltip(b1, "Markierte Bohrung aus diesem Schnitt entfernen")
+            b2 = ttk.Button(rowb, text="↺ Leeren", style="Small.TButton",
+                            command=lambda i=i: self._reset_manual(i))
+            b2.grid(row=0, column=1, sticky="ew", padx=(p(2), 0))
+            Tooltip(b2, "Alle Bohrungen aus diesem Schnitt entfernen")
+        wrap.pack(side="top", fill="both", expand=True, padx=p(8),
+                  pady=(0, 0 if manual else p(8)))
+        tv.bind("<<TreeviewSelect>>",
+                lambda e, i=i: self._on_cut_table_click(i))
+        if manual:
+            def act(_e, i=i):
+                self._set_active_cut(i)
+            for w in (outer, fr, hrow, badge, rowd, tv):
+                w.bind("<Button-1>", act, add="+")
+            Tooltip(hrow, "Klicken = aktiver manueller Schnitt\n(Klicks in "
+                          "der Zeichnung gehen in diesen Schnitt)")
+        self._cut_cols.append({"outer": outer, "badge": badge, "tv": tv,
+                               "feats": [], "color": col})
+
+    def _style_active_cut(self):
+        for i, c in enumerate(self._cut_cols):
+            active = (i == self._active_cut)
+            c["outer"].configure(bg=c["color"] if active else C["border"])
+
+    def _set_active_cut(self, i, redraw=True):
+        if i is None or i >= len(self.cuts) \
+                or self.cuts[i]["mode"] != "manual":
+            return
+        changed = (self._active_cut != i)
+        self._active_cut = i
+        self._style_active_cut()
+        L = hd.SECTION_LETTERS[i]
+        self._status(f"Aktiver manueller Schnitt: {L}-{L} — Bohrungen in "
+                     "der Zeichnung anklicken.")
+        if changed and redraw and self.result is not None:
+            self._draw(reset_view=False)
+
+    def add_cut(self, mode):
+        if len(self.cuts) >= MAX_CUTS:
+            self._status(f"Maximal {MAX_CUTS} Schnitte.", kind="warn")
+            return None
+        var = tk.StringVar(value=("horizontal" if mode == "manual"
+                                  else "beste Richtung"))
+        self.cuts.append({"mode": mode, "dir": var, "selection": []})
+        i = len(self.cuts) - 1
+        if mode == "manual":
+            self._active_cut = i
+        if not self._right_visible:
+            self.toggle_right()
+        self._rebuild_cut_columns(scroll_end=True)
+        L = hd.SECTION_LETTERS[i]
+        if mode == "manual":
+            self._status(f"Schnitt {L}-{L} (manuell) angelegt — Bohrungen in "
+                         "der Zeichnung anklicken.")
+            self._update_after_change(i)
+        else:
+            self._update_after_change(i)
+        return i
+
+    def remove_cut(self, i):
+        if i <= 0 or i >= len(self.cuts):
+            return
+        del self.cuts[i]
+        if self._active_cut is not None:
+            if self._active_cut == i:
+                manuals = [k for k, c in enumerate(self.cuts)
+                           if c["mode"] == "manual"]
+                self._active_cut = manuals[-1] if manuals else None
+            elif self._active_cut > i:
+                self._active_cut -= 1
+        self._rebuild_cut_columns()
+        self._update_after_change(i)
+
+    def _update_after_change(self, i):
+        """Nach Aenderung an Schnitt i: folgen automatische Schnitte (die
+        vom Ergebnis abhaengen), im Hintergrund neu planen, sonst sofort."""
+        if self.geo is None:
+            return
+        if any(c["mode"] == "auto" for c in self.cuts[i:]):
+            self.refresh_view(reset_view=False)
+        else:
+            self._quick_refresh()
+
+    def _on_cut_dir(self, i):
+        self._update_after_change(i)
 
     # ------------------------------------------- Seitenleisten / Panes
     def _restore_panes(self):
@@ -878,8 +1075,8 @@ class App(tk.Tk):
         if total < 200:
             self.after(80, self._restore_panes)
             return
-        lw = self._ui.get("left_width") or self.px(390)
-        rw = self._ui.get("right_width") or self.px(410)
+        lw = self._ui.get("left_width") or self.px(410)
+        rw = self._ui.get("right_width") or self.px(450)
         # Zeichnung behaelt mindestens ~40 % der Breite
         maxside = int(total * 0.60)
         if self._left_visible and self._right_visible and lw + rw > maxside:
@@ -938,8 +1135,95 @@ class App(tk.Tk):
         self.btn_left.configure(
             text=("◂ Bohrtabelle" if self._left_visible else "▸ Bohrtabelle"))
         self.btn_right.configure(
-            text=("Bohrungen im Schnitt ▸" if self._right_visible
-                  else "Bohrungen im Schnitt ◂"))
+            text=("Schnitte ▸" if self._right_visible else "Schnitte ◂"))
+
+    # ------------------------------------------------------ Drag & Drop
+    def _setup_dnd(self):
+        """STEP-Datei (oder gesicherte Einstellungen .json) auf das Fenster
+        ziehen. Benoetigt das Paket tkinterdnd2."""
+        if not self._dnd_ok:
+            return
+        self._drop_hide_job = None
+        try:
+            self.drop_target_register(DND_FILES)
+            self.dnd_bind("<<DropEnter>>", self._on_drag_enter)
+            self.dnd_bind("<<DropPosition>>", self._on_drag_pos)
+            self.dnd_bind("<<DropLeave>>", self._on_drag_leave)
+            self.dnd_bind("<<Drop>>", self._on_drop)
+        except Exception:
+            self._dnd_ok = False
+            return
+        self._dnd_register(self)
+
+    def _dnd_register(self, widget):
+        for w in widget.winfo_children():
+            if isinstance(w, tk.Toplevel):
+                continue
+            try:
+                w.drop_target_register(DND_FILES)
+                w.dnd_bind("<<DropEnter>>", self._on_drag_enter)
+                w.dnd_bind("<<DropPosition>>", self._on_drag_pos)
+                w.dnd_bind("<<DropLeave>>", self._on_drag_leave)
+                w.dnd_bind("<<Drop>>", self._on_drop)
+            except Exception:
+                pass
+            self._dnd_register(w)
+
+    def _drop_paths(self, data):
+        try:
+            return [str(x) for x in self.tk.splitlist(data)]
+        except Exception:
+            return [data] if data else []
+
+    def _on_drag_enter(self, ev):
+        if self._drop_hide_job is not None:
+            self.after_cancel(self._drop_hide_job)
+            self._drop_hide_job = None
+        if not self._drop_overlay.winfo_ismapped():
+            self._drop_overlay.place(relx=0.5, rely=0.45, anchor="center")
+            self._drop_overlay.lift()
+        return getattr(ev, "action", "copy") or "copy"
+
+    def _on_drag_pos(self, ev):
+        return getattr(ev, "action", "copy") or "copy"
+
+    def _on_drag_leave(self, ev):
+        if self._drop_hide_job is None:
+            self._drop_hide_job = self.after(150, self._hide_drop_overlay)
+        return getattr(ev, "action", "copy") or "copy"
+
+    def _hide_drop_overlay(self):
+        self._drop_hide_job = None
+        self._drop_overlay.place_forget()
+
+    def _on_drop(self, ev):
+        self._hide_drop_overlay()
+        self.handle_dropped(self._drop_paths(getattr(ev, "data", "")))
+        return getattr(ev, "action", "copy") or "copy"
+
+    def handle_dropped(self, paths):
+        steps = [x for x in paths
+                 if os.path.splitext(x)[1].lower() in (".stp", ".step")]
+        jsons = [x for x in paths if x.lower().endswith(".json")]
+        if steps:
+            path = steps[0]
+            self._ui["last_dir"] = os.path.dirname(path)
+            self.open_path(path)
+            if len(steps) > 1:
+                self.after(300, lambda: self._status(
+                    f"Nur die erste Datei geöffnet ({os.path.basename(path)})"
+                    " — es kann immer nur eine STEP-Datei offen sein.",
+                    kind="warn"))
+        elif jsons:
+            if self.geo is None:
+                self._status("Zuerst eine STEP-Datei laden, dann die "
+                             "Einstellungen (.json) darauf ziehen.",
+                             kind="warn")
+            else:
+                self.apply_settings_file(jsons[0])
+        else:
+            self._status("Bitte eine STEP-Datei (.stp / .step) ziehen.",
+                         kind="warn")
 
     # ---------------------------------------------------- Tastenkürzel
     def _bind_shortcuts(self):
@@ -1071,8 +1355,9 @@ class App(tk.Tk):
         return math.hypot(px - (ax_ + t*dx), py - (ay_ + t*dy))
 
     def _toggle_hole_at(self, x, y):
-        """Naechstgelegene Bohrung (axial ODER quer) unter dem Klick fuer
-        den manuellen Schnitt B an-/abwaehlen."""
+        """Naechstgelegene Bohrung (axial ODER quer) unter dem Klick zum
+        aktiven manuellen Schnitt hinzufuegen bzw. daraus entfernen. Gibt es
+        noch keinen manuellen Schnitt, wird einer angelegt."""
         if self.result is None:
             return
         view, rot = self.view_var.get(), self._rotation()
@@ -1091,13 +1376,39 @@ class App(tk.Tk):
                 best, bestd = f, d
         if best is None:
             return
-        idx = next((i for i, m in enumerate(self.manual_selection)
-                    if m is best), None)
+        i = self._active_cut
+        if i is None or i >= len(self.cuts) \
+                or self.cuts[i]["mode"] != "manual":
+            manuals = [k for k, c in enumerate(self.cuts)
+                       if c["mode"] == "manual"]
+            if manuals:
+                i = manuals[-1]
+                self._set_active_cut(i, redraw=False)
+            else:
+                if len(self.cuts) >= MAX_CUTS:
+                    self._status(f"Maximal {MAX_CUTS} Schnitte — für Klicks "
+                                 "einen manuellen Schnitt behalten.",
+                                 kind="warn")
+                    return
+                self.cuts.append({"mode": "manual",
+                                  "dir": tk.StringVar(value="horizontal"),
+                                  "selection": []})
+                i = len(self.cuts) - 1
+                self._active_cut = i
+                if not self._right_visible:
+                    self.toggle_right()
+                self._rebuild_cut_columns(scroll_end=True)
+                L = hd.SECTION_LETTERS[i]
+                self.after(400, lambda L=L: self._status(
+                    f"Neuer manueller Schnitt {L}-{L} angelegt — weitere "
+                    "Bohrungen anklicken."))
+        sel = self.cuts[i]["selection"]
+        idx = next((k for k, m in enumerate(sel) if m is best), None)
         if idx is None:
-            self.manual_selection.append(best)
+            sel.append(best)
         else:
-            del self.manual_selection[idx]
-        self._quick_refresh()
+            del sel[idx]
+        self._update_after_change(i)
 
     def _on_motion(self, ev):
         if (self._pan_start is None or ev.inaxes != self.ax
@@ -1157,7 +1468,11 @@ class App(tk.Tk):
         self.open_path(path)
 
     def open_path(self, path):
+        if self._busy:
+            self._status("Bitte warten — es wird noch geladen …", kind="warn")
+            return
         self.step_path = path
+        self.geo = None                 # neue Datei: keine Auswahl uebernehmen
         self.lbl_file.config(text="📄  " + os.path.basename(path))
         self.thread_overrides.clear()
         self.force_keys.clear()
@@ -1175,7 +1490,13 @@ class App(tk.Tk):
         if self._busy:
             return
         self._busy = True
-        self.manual_selection = []      # alte Feature-Objekte werden ungueltig
+        # alte Feature-Objekte werden ungueltig -> Auswahl der manuellen
+        # Schnitte merken und nach der Analyse wiederfinden
+        self._reselect = ([[self._feat_desc(f) for f in c["selection"]]
+                           for c in self.cuts] if self.geo is not None
+                          else None)
+        for c in self.cuts:
+            c["selection"] = []
         self._section_cache = {}        # bezog sich auf die alten Objekte
         self._q = queue.Queue()
         self._t0 = time.perf_counter()
@@ -1210,6 +1531,12 @@ class App(tk.Tk):
                     self._busy = False
                     self.geo = payload
                     self.geo.setdefault("outline_cache", {})
+                    resel, self._reselect = getattr(self, "_reselect",
+                                                    None), None
+                    if resel:
+                        for c, descs in zip(self.cuts, resel):
+                            c["selection"] = [f for f in map(
+                                self._match_desc, descs) if f is not None]
                     if self._pending_import is not None:
                         self._apply_pending_import()
                     self.refresh_view()
@@ -1243,26 +1570,33 @@ class App(tk.Tk):
         Schnellpfad)."""
         self._apply_overrides()
         geo, view = self.geo, self.view_var.get()
-        d, rot = self.dir_var.get(), self._rotation()
+        rot = self._rotation()
         if self.deleted_keys:
             geo = dict(self.geo)
             geo["features"] = [f for f in self.geo["features"]
                                if hd.type_key(f) not in self.deleted_keys]
         live_ids = {id(f) for f in geo["features"]}
-        self.manual_selection = [f for f in self.manual_selection
-                                 if id(f) in live_ids]
-        renum = "B" if self.renumber_var.get() == "Schnitt B" else "A"
-        return dict(geo=geo, view=view, direction=d, rotation=rot,
-                   force_keys=frozenset(self.force_keys),
-                   skip_keys=frozenset(self.skip_keys),
-                   manual_selection=list(self.manual_selection),
-                   manual_direction=self.dir2_var.get(),
-                   renumber_source=renum, section_cache=self._section_cache)
+        spec = []
+        for c in self.cuts:
+            # geloeschte Typen nur fuer die Planung weglassen (nicht aus der
+            # Auswahl entfernen -> "Rueckgaengig" stellt sie wieder her)
+            spec.append({"mode": c["mode"],
+                         "direction": DIR_VALUE.get(c["dir"].get(),
+                                                    "horizontal"),
+                         "selection": [f for f in c["selection"]
+                                       if id(f) in live_ids]})
+        return dict(geo=geo, view=view, rotation=rot,
+                    force_keys=frozenset(self.force_keys),
+                    skip_keys=frozenset(self.skip_keys),
+                    cuts=spec, section_cache=self._section_cache)
 
     def refresh_view(self, reset_view=True):
         """Ansichtsphase (Schnittplanung) im Hintergrund mit Ladebalken.
         reset_view=False erhaelt Zoom/Pan (z.B. bei Schnitt-B-Klicks)."""
-        if self.geo is None or getattr(self, "_busy_view", False):
+        if self.geo is None:
+            return
+        if getattr(self, "_busy_view", False):
+            self._refresh_again = True      # nach Abschluss erneut planen
             return
         self._busy_view = True
         kwargs = self._analyze_kwargs()
@@ -1288,6 +1622,13 @@ class App(tk.Tk):
                 return
             self._busy_view = False
             self._progress_off()
+            if self._refresh_again:
+                self._refresh_again = False
+                if kind == "ok":
+                    self.result = payload
+                    self._refresh(reset_view=reset_view)
+                self.refresh_view(reset_view=False)
+                return
             if kind == "ok":
                 self.result = payload
                 self._refresh(reset_view=reset_view)
@@ -1393,13 +1734,15 @@ class App(tk.Tk):
     # ----------------------------------------------------------- Anzeige
     def _refresh(self, reset_view=True):
         self._progress_off()
+        self._cut_letter_by_key = {}
+        for sec in self.result.get("sections", []):
+            for k in sec["new_keys"]:
+                self._cut_letter_by_key.setdefault(k, sec["letter"])
         self._populate_tree()
         self._update_section_lists()
 
         self.txt.delete("1.0", "end")
         self.txt.insert("1.0", self.result["section_text"])
-        if self.manual_selection:
-            self.txt.insert("end", "\n\n" + self._manual_section_text())
 
         self._draw(reset_view=reset_view)
 
@@ -1408,17 +1751,25 @@ class App(tk.Tk):
         n = len(feats)
         n_ax = sum(1 for f in feats if f.orientation == "axial")
         n_q = n - n_ax
-        hits = self.result.get("section_hits", [])
-        n_ht = len({f.type_no for f in hits})
         self.lbl_types_badge.configure(text=f"{len(rows)} Typen · {n} Bohr.")
+        parts = []
+        for sec in self.result.get("sections", []):
+            k = len(sec["new_keys"])
+            parts.append(f"{sec['letter']} {k}" if sec["letter"] == "A"
+                         else f"{sec['letter']} +{k}")
+        all_keys = {hd.type_key(f) for f in feats}
+        open_ = len(all_keys - set(self._cut_letter_by_key)
+                    - set(self.skip_keys))
         stxt = self.result.get("section_text") or ""
         warn = ("WARNUNG" in stxt or "NICHT ERREICHBAR" in stxt)
         self._status(
             f"✔  {n} Bohrungen · {len(rows)} Typen ({n_ax} axial, {n_q} "
-            f"quer/schräg)  ·  Schnitt A: {n_ht} Typen  ·  "
-            f"Erkennung v{hd.__version__}"
+            f"quer/schräg)  ·  Schnitte: {' · '.join(parts)} Typen  ·  "
+            + (f"⚠ noch {open_} Typ(en) ohne Schnitt  ·  " if open_
+               else "alle Typen geschnitten  ·  ")
+            + f"Erkennung v{hd.__version__}"
             + ("   ⚠ Hinweise in der Schnittführung" if warn else ""),
-            kind="warn" if warn else None)
+            kind="warn" if (warn or open_) else None)
 
     def _populate_tree(self):
         """Bohrtabelle neu befuellen, inkl. Markierungen und
@@ -1466,10 +1817,12 @@ class App(tk.Tk):
                 gt_txt = "–"
             t = r["Tiefe"]
             t_txt = f"{t:g}" if t is not None else "–"   # Durchgang: keine Tiefe
+            cut_l = (self._cut_letter_by_key.get(hd.type_key(f), "–")
+                     if f is not None else "–")
             iid = self.tree.insert("", "end", tags=tags,
                                    values=(r["Nr"], mark + str(r["Bezeichnung"]),
                                            r["Art"], t_txt, gt_txt,
-                                           r["Anzahl"], eye))
+                                           r["Anzahl"], cut_l, eye))
             if sel_no is not None and r["Nr"] == sel_no:
                 self._suppress_tree_jump = True
                 self.tree.selection_set(iid)
@@ -1490,7 +1843,7 @@ class App(tk.Tk):
         hidden_now = {f.type_no for f in self.result["features"]
                       if hd.type_key(f) in self.hidden_keys}
         hr.draw_view(self.ax, self.result, self.view_var.get(),
-                    hidden_types=hidden_now)
+                    hidden_types=hidden_now, active_section=self._active_cut)
         self.fig.tight_layout()
         if xlim is not None:
             self.ax.set_xlim(xlim)
@@ -1581,8 +1934,6 @@ class App(tk.Tk):
         key = hd.type_key(f)
         self.deleted_keys.add(key)
         self._delete_stack.append(key)
-        self.manual_selection = [m for m in self.manual_selection
-                                 if hd.type_key(m) != key]
         self.refresh_view()
 
     def _undo_delete(self):
@@ -1594,38 +1945,30 @@ class App(tk.Tk):
         self.refresh_view()
 
     # ------------------------------------------------- Schnitt B (manuell)
-    def _remove_selected_manual(self):
-        sel = self.tv_secB.selection()
-        if not sel or self.result is None:
-            if self.result is not None:
-                self._status("Bitte zuerst eine Bohrung in der Tabelle "
-                             "„Schnitt B“ auswählen.", kind="warn")
+    def _remove_selected_manual(self, i):
+        if i >= len(self._cut_cols) or self.result is None:
             return
-        hits2 = self.result.get("section2_hits") or []
-        i = int(sel[0])
-        if i < len(hits2):
-            target = hits2[i]
-            self.manual_selection = [m for m in self.manual_selection
-                                     if m is not target]
-            self._quick_refresh()
+        self._set_active_cut(i, redraw=False)
+        col = self._cut_cols[i]
+        sel = col["tv"].selection()
+        if not sel:
+            self._status("Bitte zuerst eine Bohrung in der Tabelle des "
+                         "Schnitts auswählen.", kind="warn")
+            return
+        k = int(sel[0])
+        if k < len(col["feats"]):
+            target = col["feats"][k]
+            self.cuts[i]["selection"] = [m for m in self.cuts[i]["selection"]
+                                         if m is not target]
+            self._update_after_change(i)
 
-    def _reset_manual_section(self):
-        self.manual_selection = []
-        self._quick_refresh()
+    def _reset_manual(self, i):
+        if i >= len(self.cuts):
+            return
+        self._set_active_cut(i, redraw=False)
+        self.cuts[i]["selection"] = []
+        self._update_after_change(i)
 
-    def _manual_section_text(self):
-        poly2 = self.result.get("section2_poly") or []
-        hits2 = self.result.get("section2_hits") or []
-        if not poly2:
-            return "Schnitt B-B (manuell): keine Bohrung ausgewählt."
-        lines = [f"Stufenschnitt B-B (manuell), Richtung: "
-                f"{self.dir2_var.get()}"]
-        for i, (u, v) in enumerate(poly2):
-            lines.append(f"  P{i+1}: ({u:.1f}, {v:.1f})")
-        tags = ", ".join(f"#{f.type_no}" for f in hits2)
-        lines.append(f"Geschnittene Bohrungen: {tags or '—'}  "
-                     f"({len(hits2)} Bohrungen)")
-        return "\n".join(lines)
 
     @staticmethod
     def _sec_row(f):
@@ -1633,11 +1976,13 @@ class App(tk.Tk):
             f.orientation, f.orientation)
         return (f.type_no, f.label, "durch" if f.through else "Sack", ori)
 
-    def _fill_section_table(self, tv, feats):
+    def _fill_section_table(self, tv, feats, prior_keys=frozenset()):
         tv.delete(*tv.get_children())
         for i, f in enumerate(feats):
             tags = ["odd"] if i % 2 else []
-            if f.kind == "Gewinde":
+            if hd.type_key(f) in prior_keys:
+                tags.append("dim")          # schon in frueherem Schnitt
+            elif f.kind == "Gewinde":
                 tags.append("thread")
             elif f.orientation != "axial":
                 tags.append("cross")
@@ -1645,29 +1990,38 @@ class App(tk.Tk):
                       tags=tags)
 
     def _update_section_lists(self):
-        self._section_feats = list(self.result.get("section_hits", []))
-        self._fill_section_table(self.tv_secA, self._section_feats)
-        n_types = len({f.type_no for f in self._section_feats})
-        self.lbl_badge_a.configure(
-            text=f"{len(self._section_feats)} Bohr. · {n_types} Typen")
-
-        self._section2_feats = list(self.result.get("section2_hits", []))
-        self._fill_section_table(self.tv_secB, self._section2_feats)
-        n_types2 = len({f.type_no for f in self._section2_feats})
-        self.lbl_badge_b.configure(
-            text=(f"{len(self._section2_feats)} Bohr. · {n_types2} Typen"
-                  if self._section2_feats else "leer"))
+        sections = self.result.get("sections") or []
+        for i, col in enumerate(self._cut_cols):
+            sec = sections[i] if i < len(sections) else None
+            if sec is None:
+                col["feats"] = []
+                col["tv"].delete(*col["tv"].get_children())
+                col["badge"].configure(text="wird geplant …")
+                continue
+            col["feats"] = list(sec["hits"])
+            self._fill_section_table(col["tv"], col["feats"],
+                                     sec["prior_keys"])
+            n_new = len(sec["new_keys"])
+            n_types = len({f.type_no for f in col["feats"]})
+            if not col["feats"]:
+                txt = ("alle Typen schon geschnitten" if sec["mode"] == "auto"
+                       else "Bohrungen in der Zeichnung anklicken")
+            else:
+                txt = (f"{len(col['feats'])} Bohr. · {n_types} Typen"
+                       + ("" if i == 0 else f" · neu: {n_new}"))
+                if sec.get("requested_direction") == "best":
+                    txt += f"\ngewählt: {DIR_LABEL.get(sec['direction'], '')}"
+            col["badge"].configure(text=txt)
 
     # ------------------------------------------------- Navigation/Fokus
-    def _on_sectionA_click(self, _ev):
-        sel = self.tv_secA.selection()
-        if sel and int(sel[0]) < len(self._section_feats):
-            self._goto_feature(self._section_feats[int(sel[0])])
+    def _on_cut_table_click(self, i):
+        if i >= len(self._cut_cols):
+            return
+        col = self._cut_cols[i]
+        sel = col["tv"].selection()
+        if sel and int(sel[0]) < len(col["feats"]):
+            self._goto_feature(col["feats"][int(sel[0])])
 
-    def _on_sectionB_click(self, _ev):
-        sel = self.tv_secB.selection()
-        if sel and int(sel[0]) < len(self._section2_feats):
-            self._goto_feature(self._section2_feats[int(sel[0])])
 
     def _on_tree_click(self, _ev):
         if getattr(self, "_suppress_tree_jump", False):
@@ -1677,7 +2031,9 @@ class App(tk.Tk):
         if not sel or self.result is None:
             return
         tno = int(self.tree.item(sel[0])["values"][0])
-        f = next((x for x in self._section_feats if x.type_no == tno),
+        hits = [x for sec in self.result.get("sections", [])
+                for x in sec["hits"]]
+        f = next((x for x in hits if x.type_no == tno),
                  next((x for x in self.result["features"]
                        if x.type_no == tno), None))
         if f:
@@ -1727,10 +2083,18 @@ class App(tk.Tk):
         if not path:
             return
         rows = hd.table_rows(self.result["features"])
+        first = {}
+        for f in self.result["features"]:
+            first.setdefault(f.type_no, f)
+        for r in rows:
+            f = first.get(r["Nr"])
+            r["Schnitt"] = (self._cut_letter_by_key.get(hd.type_key(f), "")
+                            if f is not None else "")
         with open(path, "w", newline="", encoding="utf-8-sig") as fh:
             w = csv.DictWriter(fh, fieldnames=["Nr", "Bezeichnung",
                                                "Durchmesser", "Art", "Tiefe",
-                                               "Gewindetiefe", "Anzahl"],
+                                               "Gewindetiefe", "Anzahl",
+                                               "Schnitt"],
                                delimiter=";")
             w.writeheader()
             w.writerows(rows)
@@ -1763,6 +2127,23 @@ class App(tk.Tk):
         cb = tuple(lst[5]) if lst[5] is not None else None
         return (lst[0], lst[1], lst[2], lst[3], lst[4], cb)
 
+    @staticmethod
+    def _feat_desc(f):
+        return {"axis_pt": list(f.axis_pt), "axis_dir": list(f.axis_dir),
+                "diameter": f.diameter, "z0": f.z0, "z1": f.z1}
+
+    def _match_desc(self, desc):
+        best, bestd = None, None
+        for f in self.geo["features"]:
+            dd = sum(abs(f.axis_pt[i] - desc["axis_pt"][i]) for i in range(3))
+            if dd > 1.0 or abs(f.diameter - desc["diameter"]) > 0.5:
+                continue
+            if abs(f.z0 - desc["z0"]) > 1.0 or abs(f.z1 - desc["z1"]) > 1.0:
+                continue
+            if best is None or dd < bestd:
+                best, bestd = f, dd
+        return best
+
     def export_settings(self):
         """Alle manuellen Einstellungen zu dieser Platte (Ansicht, Schnitt B,
         Erzwingen/Nicht-nötig/Ausblenden/Löschen, Gewinde-Zuordnung) als JSON
@@ -1785,10 +2166,13 @@ class App(tk.Tk):
                         else None,
             "view": self.view_var.get(),
             "rotation": self._rotation(),
-            "direction": self.dir_var.get(),
-            "manual_direction": self.dir2_var.get(),
-            "renumber_source": ("B" if self.renumber_var.get() == "Schnitt B"
-                                else "A"),
+            "direction": DIR_VALUE.get(self.dir_var.get(), "horizontal"),
+            "cuts": [{"mode": c["mode"],
+                      "direction": DIR_VALUE.get(c["dir"].get(),
+                                                 "horizontal"),
+                      "selection": [self._feat_desc(f)
+                                    for f in c["selection"]]}
+                     for c in self.cuts],
             "thread_requires_chamfer": self.chamfer_var.get(),
             "thread_map": {str(k): v for k, v in self.thread_map.items()},
             "thread_overrides": {str(k): v for k, v
@@ -1797,10 +2181,6 @@ class App(tk.Tk):
             "skip_keys": [self._key_to_json(k) for k in self.skip_keys],
             "hidden_keys": [self._key_to_json(k) for k in self.hidden_keys],
             "deleted_keys": [self._key_to_json(k) for k in self.deleted_keys],
-            "manual_selection": [
-                {"axis_pt": list(f.axis_pt), "axis_dir": list(f.axis_dir),
-                 "diameter": f.diameter, "z0": f.z0, "z1": f.z1}
-                for f in self.manual_selection],
         }
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2, ensure_ascii=False)
@@ -1833,8 +2213,9 @@ class App(tk.Tk):
                     "Einstellungen laden",
                     f"Die Einstellungen wurden für '{saved}' gespeichert, "
                     f"aktuell ist aber '{cur}' geladen. Trotzdem "
-                    "anwenden? (Bohrungsauswahl für Schnitt B wird nur "
-                    "übernommen, wenn passende Bohrungen gefunden werden)"):
+                    "anwenden? (Bohrungsauswahl manueller Schnitte wird "
+                    "nur übernommen, wenn passende Bohrungen gefunden "
+                    "werden)"):
                 return
 
         self._pending_import = data
@@ -1865,11 +2246,6 @@ class App(tk.Tk):
                                  in data.get("thread_overrides", {}).items()}
         self.view_var.set(data.get("view", self.view_var.get()))
         self.rot_var.set(f"{int(data.get('rotation', 0)) % 360}°")
-        self.dir_var.set(data.get("direction", self.dir_var.get()))
-        self.dir2_var.set(data.get("manual_direction", self.dir2_var.get()))
-        self.renumber_var.set(
-            "Schnitt B" if data.get("renumber_source", "A") == "B"
-            else "Schnitt A")
         self.force_keys = {self._json_to_key(k)
                            for k in data.get("force_keys", [])}
         self.skip_keys = {self._json_to_key(k)
@@ -1879,31 +2255,44 @@ class App(tk.Tk):
         self.deleted_keys = {self._json_to_key(k)
                              for k in data.get("deleted_keys", [])}
 
-        feats = self.geo["features"]
-        selection = []
+        cuts_data = data.get("cuts")
+        if not cuts_data:                    # Einstellungen aus v2 / v3.0
+            cuts_data = [{"mode": "auto",
+                          "direction": data.get("direction", "horizontal")}]
+            if data.get("manual_selection"):
+                cuts_data.append({
+                    "mode": "manual",
+                    "direction": data.get("manual_direction", "horizontal"),
+                    "selection": data.get("manual_selection", [])})
         missing = 0
-        for desc in data.get("manual_selection", []):
-            best, bestd = None, None
-            for f in feats:
-                dd = sum(abs(f.axis_pt[i] - desc["axis_pt"][i])
-                        for i in range(3))
-                if dd > 1.0 or abs(f.diameter - desc["diameter"]) > 0.5:
-                    continue
-                if (abs(f.z0 - desc["z0"]) > 1.0
-                        or abs(f.z1 - desc["z1"]) > 1.0):
-                    continue
-                if best is None or dd < bestd:
-                    best, bestd = f, dd
-            if best is not None:
-                selection.append(best)
+        new_cuts = []
+        for i, cd in enumerate(cuts_data[:MAX_CUTS]):
+            mode = "manual" if (i > 0 and cd.get("mode") == "manual") \
+                else "auto"
+            lab = DIR_LABEL.get(cd.get("direction", "horizontal"),
+                                "horizontal")
+            if i == 0:
+                var = self.dir_var
+                var.set(lab)
             else:
-                missing += 1
-        self.manual_selection = selection
+                var = tk.StringVar(value=lab)
+            sel = []
+            for desc in cd.get("selection", []) if mode == "manual" else []:
+                f = self._match_desc(desc)
+                if f is not None:
+                    sel.append(f)
+                else:
+                    missing += 1
+            new_cuts.append({"mode": mode, "dir": var, "selection": sel})
+        self.cuts = new_cuts
+        manuals = [k for k, c in enumerate(self.cuts) if c["mode"] == "manual"]
+        self._active_cut = manuals[-1] if manuals else None
+        self._rebuild_cut_columns()
         self._section_cache = {}
         if missing:
             messagebox.showwarning(
                 "Einstellungen laden",
-                f"{missing} Bohrung(en) für Schnitt B konnten in der "
+                f"{missing} Bohrung(en) manueller Schnitte konnten in der "
                 "aktuell geladenen Geometrie nicht wiedergefunden werden "
                 "und wurden übersprungen.")
 
