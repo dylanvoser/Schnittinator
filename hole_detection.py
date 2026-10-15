@@ -1895,7 +1895,8 @@ def _schneidbar(f):
 def analyze_view(geo, view="top", direction="horizontal", rotation=0,
                  force_keys=frozenset(), skip_keys=frozenset(),
                  manual_selection=(), manual_direction="horizontal",
-                 renumber_source="A", section_cache=None, cuts=None):
+                 renumber_source="A", section_cache=None, cuts=None,
+                 number_start=0):
     """LEICHTE Phase: Orientierung/Projektion (inkl. Bilddrehung),
     Stufenschnitte, Nummerierung, Text, Aussenkontur.
 
@@ -1910,10 +1911,12 @@ def analyze_view(geo, view="top", direction="horizontal", rotation=0,
       * Manuelle Schnitte laufen durch die angeklickten Bohrungen.
       Ohne cuts gilt das alte Verhalten: A automatisch (+ B manuell, falls
       manual_selection gesetzt).
-    Nummerierung: Typen in Schnitt A bekommen 1..k in Schnittreihenfolge,
-    Typen, die erst in B neu dazukommen, zaehlen fortlaufend weiter (k+1..),
-    dann C usw.; Typen in keinem Schnitt zuletzt. (renumber_source wird nur
-    noch aus Kompatibilitaetsgruenden angenommen.)
+    Nummerierung: beginnt beim Schnitt number_start (Index in cuts, z. B.
+    der automatische Schnitt A oder ein manueller Schnitt): dessen Typen
+    bekommen 1..k in Schnittreihenfolge; danach zaehlen die uebrigen
+    Schnitte in Reihenfolge A, B, C … fortlaufend weiter (nur neue Typen);
+    Typen in keinem Schnitt zuletzt. renumber_source='B' (altes Verhalten)
+    entspricht number_start=1.
     section_cache: optionales, vom Aufrufer gehaltenes dict fuer die teuren
     automatischen Stufenschnitte (wichtig, damit Klicks fuer manuelle
     Schnitte nicht jedes Mal alles neu optimieren)."""
@@ -1976,8 +1979,26 @@ def analyze_view(geo, view="top", direction="horizontal", rotation=0,
         covered_set.update(new)
         sections.append(sec)
 
-    mapping = renumber_by_section(feats, [f for sec in sections
-                                         for f in sec["hits"]])
+    # --- Nummerierungsreihenfolge: gewaehlter Startschnitt, dann der Rest
+    if renumber_source == "B" and number_start == 0 and len(sections) > 1:
+        number_start = 1
+    start = number_start if 0 <= number_start < len(sections) else 0
+    order = [start] + [k for k in range(len(sections)) if k != start]
+    seen = set()
+    for k in order:                  # "neu" / "frueher" in DIESER Reihenfolge
+        sec = sections[k]
+        sec["plan_prior_keys"] = sec["prior_keys"]
+        sec["prior_keys"] = frozenset(seen)
+        new = []
+        for f in sec["hits"]:
+            kk = type_key(f)
+            if kk not in seen and kk not in new:
+                new.append(kk)
+        sec["new_keys"] = frozenset(new)
+        sec["number_rank"] = order.index(k)
+        seen.update(new)
+    mapping = renumber_by_section(feats, [f for k in order
+                                         for f in sections[k]["hits"]])
     texts = []
     for sec in sections:
         soft = {mapping.get(t, t): n for t, n in sec["soft"].items()}
@@ -1992,12 +2013,14 @@ def analyze_view(geo, view="top", direction="horizontal", rotation=0,
                     warn=("WARNUNG" in sec["raw"]), rotation=rotation,
                     soft=soft, force_keys=sec["force_keys"],
                     skip_keys=skip_keys, name=sec["name"],
-                    prior_keys=sec["prior_keys"])
+                    prior_keys=sec["prior_keys"],
+                    planned_without=sec["plan_prior_keys"])
         else:
             txt = manual_section_text(feats, sec)
         sec["text"] = txt
         texts.append(txt)
-    texts.append(sections_summary(feats, sections, skip_keys))
+    texts.append(sections_summary(feats, [sections[k] for k in order],
+                                  skip_keys))
     section_txt = "\n\n".join(texts)
 
     if "outline_cache" not in geo:
@@ -2023,6 +2046,7 @@ def analyze_view(geo, view="top", direction="horizontal", rotation=0,
         "section2_poly": second["poly"] if second else [],
         "section2_hits": second["hits"] if second else [],
         "renumber_source": "A",
+        "number_start": start,
     })
     return res
 
@@ -2071,8 +2095,9 @@ def sections_summary(features, sections, skip_keys=frozenset()):
     by_key = {}
     for f in features:
         by_key.setdefault(type_key(f), f.type_no)
-    lines = ["UEBERSICHT DER SCHNITTE (Bohrnummern fortlaufend: erst "
-             "Schnitt A, dann B, ...)"]
+    lines = ["UEBERSICHT DER SCHNITTE (Bohrnummern fortlaufend in dieser "
+             "Reihenfolge: " + " -> ".join(x["name"] for x in sections)
+             + ")"]
     covered = set()
     for sec in sections:
         nums = [by_key[k] for k in sec["new_keys"] if k in by_key]
@@ -2165,7 +2190,8 @@ def renumber_by_section(features, hits):
 def build_section_text(features, poly, hits, view, direction, warn=False,
                        cluster_tol=1.0, rotation=0, soft=None,
                        force_keys=frozenset(), skip_keys=frozenset(),
-                       name="A-A", prior_keys=frozenset()):
+                       name="A-A", prior_keys=frozenset(),
+                       planned_without=frozenset()):
     if not poly:
         return "Keine schnittbaren Bohrungen in dieser Ansicht."
     horiz = (direction == "horizontal")
@@ -2238,7 +2264,9 @@ def build_section_text(features, poly, hits, view, direction, warn=False,
     if skip_t:
         txt.append("Als 'nicht noetig' markiert: Typ "
                    + ", ".join(map(str, sorted(skip_t))))
-    miss = sorted(reach_t - hit_t - skip_t - prior_t)
+    plan_t = set(f.type_no for f in features
+                 if type_key(f) in planned_without)
+    miss = sorted(reach_t - hit_t - skip_t - prior_t - plan_t)
     if miss:
         txt.append(f"In {name} nicht schneidbar ohne Regelverletzung "
                    "(ggf. weiteren Schnitt hinzufuegen; Umgebung zu "

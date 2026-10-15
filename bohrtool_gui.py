@@ -225,6 +225,7 @@ class App(tk.Tk, _DnDBase):
             self._ui.get("direction", "horizontal"), "horizontal"))
         self.cuts = [{"mode": "auto", "dir": self.dir_var, "selection": []}]
         self._active_cut = None          # Index des manuellen Schnitts fuer Klicks
+        self._number_start = 0           # Nummerierung beginnt bei Schnitt …
         self._cut_cols = []
         self._cut_letter_by_key = {}
         self._refresh_again = False
@@ -841,12 +842,28 @@ class App(tk.Tk, _DnDBase):
                 "Weiteren AUTOMATISCHEN Schnitt anlegen: schneidet die\n"
                 "Bohrungstypen, die in den bisherigen Schnitten fehlen")
 
-        tk.Label(body, text="Bohrnummern fortlaufend: erst Schnitt A, dann B, "
-                            "…  ·  grau = schon in früherem Schnitt  ·  "
-                            "Klick = hinspringen", bg=C["panel"],
+        tk.Label(body, text="Nummern laufen fortlaufend weiter: erst der "
+                            "gewählte Schnitt, dann die übrigen (A, B, …)  ·  "
+                            "grau = Typ hat schon eine Nummer  ·  Klick = "
+                            "hinspringen", bg=C["panel"],
                  fg=C["muted"], font=(FONT, 8), anchor="w", justify="left",
                  wraplength=p(400))\
-            .pack(side="bottom", fill="x", pady=(p(6), 0))
+            .pack(side="bottom", fill="x", pady=(p(4), 0))
+        rown = tk.Frame(body, bg=C["panel"])
+        rown.pack(side="bottom", fill="x", pady=(p(8), 0))
+        tk.Label(rown, text="Bohrnummern beginnen bei", bg=C["panel"],
+                 fg=C["text"], font=(FONT_SEMI, 9)).pack(side="left")
+        self.number_var = tk.StringVar()
+        self.cb_number = ttk.Combobox(rown, textvariable=self.number_var,
+                                      width=24, state="readonly")
+        self.cb_number.pack(side="right")
+        self.cb_number.bind("<<ComboboxSelected>>",
+                            lambda e: self._on_number_start())
+        Tooltip(self.cb_number,
+                "Nr. 1 = erste Bohrung in diesem Schnitt (automatisch oder\n"
+                "manuell), dann fortlaufend durch die übrigen Schnitte")
+        tk.Frame(body, bg=C["border"], height=1).pack(side="bottom", fill="x",
+                                                       pady=(p(8), 0))
 
         wrap = tk.Frame(body, bg=C["panel"])
         wrap.pack(fill="both", expand=True)
@@ -907,6 +924,7 @@ class App(tk.Tk, _DnDBase):
                 or self.cuts[self._active_cut]["mode"] != "manual"):
             self._active_cut = None
         self._style_active_cut()
+        self._update_number_choices()
         if self._dnd_ok:
             self._dnd_register(self._cut_inner)
         if self.result is not None and self.result.get("sections"):
@@ -999,6 +1017,27 @@ class App(tk.Tk, _DnDBase):
         self._cut_cols.append({"outer": outer, "badge": badge, "tv": tv,
                                "feats": [], "color": col})
 
+    def _cut_label(self, i):
+        L = hd.SECTION_LETTERS[i]
+        mode = ("automatisch" if self.cuts[i]["mode"] == "auto"
+                else "manuell")
+        return f"Schnitt {L}-{L} ({mode})"
+
+    def _update_number_choices(self):
+        if not (0 <= self._number_start < len(self.cuts)):
+            self._number_start = 0
+        vals = [self._cut_label(i) for i in range(len(self.cuts))]
+        self.cb_number.configure(values=vals)
+        self.number_var.set(vals[self._number_start])
+
+    def _on_number_start(self):
+        vals = list(self.cb_number.cget("values"))
+        try:
+            self._number_start = vals.index(self.number_var.get())
+        except ValueError:
+            self._number_start = 0
+        self._quick_refresh()
+
     def _style_active_cut(self):
         for i, c in enumerate(self._cut_cols):
             active = (i == self._active_cut)
@@ -1043,6 +1082,10 @@ class App(tk.Tk, _DnDBase):
         if i <= 0 or i >= len(self.cuts):
             return
         del self.cuts[i]
+        if self._number_start == i:
+            self._number_start = 0
+        elif self._number_start > i:
+            self._number_start -= 1
         if self._active_cut is not None:
             if self._active_cut == i:
                 manuals = [k for k, c in enumerate(self.cuts)
@@ -1588,7 +1631,8 @@ class App(tk.Tk, _DnDBase):
         return dict(geo=geo, view=view, rotation=rot,
                     force_keys=frozenset(self.force_keys),
                     skip_keys=frozenset(self.skip_keys),
-                    cuts=spec, section_cache=self._section_cache)
+                    cuts=spec, section_cache=self._section_cache,
+                    number_start=self._number_start)
 
     def refresh_view(self, reset_view=True):
         """Ansichtsphase (Schnittplanung) im Hintergrund mit Ladebalken.
@@ -1753,9 +1797,11 @@ class App(tk.Tk, _DnDBase):
         n_q = n - n_ax
         self.lbl_types_badge.configure(text=f"{len(rows)} Typen · {n} Bohr.")
         parts = []
-        for sec in self.result.get("sections", []):
+        ordered = sorted(self.result.get("sections", []),
+                         key=lambda x: x.get("number_rank", 0))
+        for j, sec in enumerate(ordered):   # in Nummerierungsreihenfolge
             k = len(sec["new_keys"])
-            parts.append(f"{sec['letter']} {k}" if sec["letter"] == "A"
+            parts.append(f"{sec['letter']} {k}" if j == 0
                          else f"{sec['letter']} +{k}")
         all_keys = {hd.type_key(f) for f in feats}
         open_ = len(all_keys - set(self._cut_letter_by_key)
@@ -2173,6 +2219,7 @@ class App(tk.Tk, _DnDBase):
                       "selection": [self._feat_desc(f)
                                     for f in c["selection"]]}
                      for c in self.cuts],
+            "number_start": self._number_start,
             "thread_requires_chamfer": self.chamfer_var.get(),
             "thread_map": {str(k): v for k, v in self.thread_map.items()},
             "thread_overrides": {str(k): v for k, v
@@ -2285,6 +2332,11 @@ class App(tk.Tk, _DnDBase):
                     missing += 1
             new_cuts.append({"mode": mode, "dir": var, "selection": sel})
         self.cuts = new_cuts
+        if "number_start" in data:
+            self._number_start = int(data.get("number_start") or 0)
+        else:                       # v3.0: "Nummerierung nach Schnitt B"
+            self._number_start = (1 if data.get("renumber_source") == "B"
+                                  and len(self.cuts) > 1 else 0)
         manuals = [k for k, c in enumerate(self.cuts) if c["mode"] == "manual"]
         self._active_cut = manuals[-1] if manuals else None
         self._rebuild_cut_columns()
