@@ -36,6 +36,19 @@ from OCP.Bnd import Bnd_Box
 from OCP.BRepBndLib import BRepBndLib
 from OCP.gp import gp_Pnt, gp_Vec, gp_Dir
 
+
+def ocp_static(cls, name):
+    """Statische OCP-Methode versionsunabhaengig holen: OCP <= 7.9 haengt
+    ein '_s' an (TopoDS.Face_s), OCP >= 8.0 nicht mehr (TopoDS.Face)."""
+    return getattr(cls, name + "_s", None) or getattr(cls, name)
+
+
+def box_limits(box):
+    """(x0, y0, z0, x1, y1, z1) eines Bnd_Box - funktioniert mit OCP 7.x
+    (Get() liefert ein Tupel) und OCP 8.x (Get() liefert ein Struct)."""
+    p0, p1 = box.CornerMin(), box.CornerMax()
+    return p0.X(), p0.Y(), p0.Z(), p1.X(), p1.Y(), p1.Z()
+
 # ----------------------------------------------------------------------------
 # Toleranzen / Konstanten
 # ----------------------------------------------------------------------------
@@ -244,7 +257,7 @@ def collect_segments(shape):
     cyls, cones = [], []
     ex = TopExp_Explorer(shape, TopAbs_FACE)
     while ex.More():
-        face = TopoDS.Face_s(ex.Current())
+        face = ocp_static(TopoDS, "Face")(ex.Current())
         ad = BRepAdaptor_Surface(face)
         stype = ad.GetType()
         if stype in (GeomAbs_Cylinder, GeomAbs_Cone):
@@ -903,7 +916,9 @@ def plan_step_section(features, view="top", direction="horizontal",
                                   min(ta, tb) - infl_t, max(ta, tb) + infl_t))
 
     if not nodes:
-        return [], [], "Keine schnittbaren Bohrungen in dieser Ansicht."
+        # gleiche Rueckgabeform wie unten (poly, hits, text, score, soft)
+        return ([], [], "Keine schnittbaren Bohrungen in dieser Ansicht.",
+                (float("-inf"),), {})
 
     nodes.sort(key=lambda nd: (nd["s0"], nd["s1"]))
     n = len(nodes)
@@ -1804,8 +1819,8 @@ def plan_manual_section(selected, all_features, view="top",
 def bounds_uv(shape, view, rotation=0):
     """Bounding Box des Bauteils in Bildkoordinaten (u0, v0, u1, v1)."""
     box = Bnd_Box()
-    BRepBndLib.Add_s(shape, box)
-    x0, y0, z0, x1, y1, z1 = box.Get()
+    ocp_static(BRepBndLib, "Add")(shape, box)
+    x0, y0, z0, x1, y1, z1 = box_limits(box)
     ud, wd = effective_uv(view, rotation)
     us, vs = [], []
     for x in (x0, x1):
@@ -1837,79 +1852,271 @@ def analyze_geometry(shape_or_path, thread_map=None,
     }
 
 
+SECTION_LETTERS = "ABCDEF"      # Schnitt A-A, B-B, ... (max. 6 Schnitte)
+
+
+def _plan_auto(feats, view, direction, rotation, bnds, force_keys, skip_keys,
+               cache):
+    """Automatischen Stufenschnitt planen (je Richtung mit und ohne
+    Spiegelung, bestes Ergebnis). direction 'best' probiert horizontal UND
+    vertikal. Ergebnisse werden im (vom Aufrufer gehaltenen) cache-dict
+    zwischengespeichert. Rueckgabe: (richtung, poly, hits, raw_txt, score,
+    soft)."""
+    dirs = (["horizontal", "vertical"] if direction == "best"
+            else [direction])
+    ids = tuple(id(f) for f in feats)
+    best = None
+    for d in dirs:
+        key = (view, d, int(rotation) % 360, frozenset(force_keys),
+               frozenset(skip_keys), ids)
+        res = cache.get(key) if cache is not None else None
+        if res is None:
+            b = None
+            for mir in (False, True):
+                poly_, hits_, raw_, sc_, soft_ = plan_step_section(
+                    feats, view, d, bounds=bnds, rotation=rotation,
+                    _mirror=mir, force_keys=force_keys, skip_keys=skip_keys)
+                if b is None or sc_ > b[3]:
+                    b = (poly_, hits_, raw_, sc_, soft_)
+            res = b
+            if cache is not None:
+                if len(cache) > 48:
+                    cache.clear()
+                cache[key] = res
+        if best is None or res[3] > best[4]:
+            best = (d,) + tuple(res)
+    return best
+
+
+def _schneidbar(f):
+    return f.orientation in ("axial", "quer")
+
+
 def analyze_view(geo, view="top", direction="horizontal", rotation=0,
                  force_keys=frozenset(), skip_keys=frozenset(),
                  manual_selection=(), manual_direction="horizontal",
-                 renumber_source="A", section_cache=None):
+                 renumber_source="A", section_cache=None, cuts=None,
+                 number_start=0):
     """LEICHTE Phase: Orientierung/Projektion (inkl. Bilddrehung),
-    Stufenschnitt, manueller Zweitschnitt B-B, Nummerierung entlang des
-    gewaehlten Schnitts (renumber_source 'A' oder 'B'), Text, Aussenkontur.
-    manual_selection: Feature-Objekte aus geo['features'] fuer Schnitt B.
-    section_cache: optionales, vom Aufrufer gehaltenes dict — der teure
-    Stufenschnitt A-A (doppelte Planung mit/ohne Spiegelung) wird darin
-    zwischengespeichert und bei unveraenderten Eingaben (Ansicht, Richtung,
-    Drehung, Erzwingen-/Nicht-noetig-Markierungen, Bohrungsmenge)
-    wiederverwendet — wichtig, damit Schnitt-B-Aenderungen (Klick fuer
-    manuelle Bohrungsauswahl) nicht jedes Mal die komplette, aufwendige
-    Stufenschnitt-Optimierung neu durchlaufen."""
+    Stufenschnitte, Nummerierung, Text, Aussenkontur.
+
+    cuts: Liste der Schnitte in Reihenfolge A, B, C, ... — je Eintrag ein
+      dict {"mode": "auto"|"manual", "direction": "horizontal"|"vertical"|
+      "best", "selection": [Feature, ...] (nur manuell)}.
+      * Schnitt A ist der Hauptschnitt.
+      * Jeder weitere AUTOMATISCHE Schnitt zielt nur auf die Bohrungstypen,
+        die in den vorherigen Schnitten noch NICHT enthalten sind (bereits
+        geschnittene Typen gelten dort als 'nicht noetig' und duerfen
+        gekreuzt / angeschnitten werden).
+      * Manuelle Schnitte laufen durch die angeklickten Bohrungen.
+      Ohne cuts gilt das alte Verhalten: A automatisch (+ B manuell, falls
+      manual_selection gesetzt).
+    Nummerierung: beginnt beim Schnitt number_start (Index in cuts, z. B.
+    der automatische Schnitt A oder ein manueller Schnitt): dessen Typen
+    bekommen 1..k in Schnittreihenfolge; danach zaehlen die uebrigen
+    Schnitte in Reihenfolge A, B, C … fortlaufend weiter (nur neue Typen);
+    Typen in keinem Schnitt zuletzt. renumber_source='B' (altes Verhalten)
+    entspricht number_start=1.
+    section_cache: optionales, vom Aufrufer gehaltenes dict fuer die teuren
+    automatischen Stufenschnitte (wichtig, damit Klicks fuer manuelle
+    Schnitte nicht jedes Mal alles neu optimieren)."""
     feats = assign_type_numbers(geo["features"])
     feats = classify_view(feats, view, rotation)
     bnds = bounds_uv(geo["shape"], view, rotation)
+    if cuts is None:
+        cuts = [{"mode": "auto", "direction": direction}]
+        if manual_selection:
+            cuts.append({"mode": "manual", "direction": manual_direction,
+                         "selection": list(manual_selection)})
+    cuts = list(cuts)[:len(SECTION_LETTERS)]
+    live = set(id(f) for f in feats)
+    force_keys, skip_keys = frozenset(force_keys), frozenset(skip_keys)
 
-    cache_key = (view, direction, int(rotation) % 360,
-                frozenset(force_keys), frozenset(skip_keys),
-                tuple(id(f) for f in feats))
-    cached = section_cache.get(cache_key) if section_cache is not None \
-        else None
-    if cached is not None:
-        poly, hits, raw_txt, soft_sum = cached
-    else:
-        best = None
-        for mir in (False, True):
-            poly_, hits_, raw_, sc_, soft_ = plan_step_section(
-                feats, view, direction, bounds=bnds, rotation=rotation,
-                _mirror=mir, force_keys=force_keys, skip_keys=skip_keys)
-            if best is None or sc_ > best[3]:
-                best = (poly_, hits_, raw_, sc_, soft_)
-        poly, hits, raw_txt, _, soft_sum = best
-        if section_cache is not None:
-            section_cache.clear()   # nur die aktuelle Ansicht vorhalten
-            section_cache[cache_key] = (poly, hits, raw_txt, soft_sum)
+    covered_set = set()
+    sections = []
+    for i, c in enumerate(cuts):
+        letter = SECTION_LETTERS[i]
+        mode = c.get("mode", "auto")
+        req_dir = c.get("direction", "horizontal")
+        prior = frozenset(covered_set)
+        sec = {"letter": letter, "name": f"{letter}-{letter}", "mode": mode,
+               "requested_direction": req_dir, "prior_keys": prior,
+               "poly": [], "hits": [], "raw": "", "soft": {},
+               "force_keys": frozenset(), "skip_keys": skip_keys,
+               "empty_reason": None}
+        if mode == "auto":
+            f_k = force_keys - prior
+            s_k = skip_keys | prior
+            goals = {type_key(f) for f in feats if _schneidbar(f)} - s_k
+            if i > 0 and not goals:
+                sec["direction"] = req_dir if req_dir != "best" \
+                    else "horizontal"
+                sec["empty_reason"] = (
+                    "Alle schneidbaren Bohrungstypen sind bereits in "
+                    "frueheren Schnitten enthalten.")
+            else:
+                d, poly, hits, raw, _sc, soft = _plan_auto(
+                    feats, view, req_dir, rotation, bnds, f_k, s_k,
+                    section_cache)
+                sec.update(direction=d, poly=poly, hits=hits, raw=raw,
+                           soft=soft, force_keys=f_k)
+        else:
+            d = req_dir if req_dir in ("horizontal", "vertical") \
+                else "horizontal"
+            sel = [f for f in c.get("selection", ()) if id(f) in live]
+            poly, hits = plan_manual_section(sel, feats, view=view,
+                                             direction=d, rotation=rotation)
+            sec.update(direction=d, poly=poly, hits=hits)
+            if not sel:
+                sec["empty_reason"] = ("Noch keine Bohrung gewaehlt - "
+                                       "Bohrungen in der Zeichnung anklicken.")
+        new = []
+        for f in sec["hits"]:
+            k = type_key(f)
+            if k not in covered_set and k not in new:
+                new.append(k)
+        sec["new_keys"] = frozenset(new)
+        covered_set.update(new)
+        sections.append(sec)
 
-    poly2, hits2 = plan_manual_section(
-        list(manual_selection), feats, view=view,
-        direction=manual_direction, rotation=rotation) \
-        if manual_selection else ([], [])
+    # --- Nummerierungsreihenfolge: gewaehlter Startschnitt, dann der Rest
+    if renumber_source == "B" and number_start == 0 and len(sections) > 1:
+        number_start = 1
+    start = number_start if 0 <= number_start < len(sections) else 0
+    order = [start] + [k for k in range(len(sections)) if k != start]
+    seen = set()
+    for k in order:                  # "neu" / "frueher" in DIESER Reihenfolge
+        sec = sections[k]
+        sec["plan_prior_keys"] = sec["prior_keys"]
+        sec["prior_keys"] = frozenset(seen)
+        new = []
+        for f in sec["hits"]:
+            kk = type_key(f)
+            if kk not in seen and kk not in new:
+                new.append(kk)
+        sec["new_keys"] = frozenset(new)
+        sec["number_rank"] = order.index(k)
+        seen.update(new)
+    mapping = renumber_by_section(feats, [f for k in order
+                                         for f in sections[k]["hits"]])
+    texts = []
+    for sec in sections:
+        soft = {mapping.get(t, t): n for t, n in sec["soft"].items()}
+        sec["soft"] = soft
+        if sec["mode"] == "auto":
+            if sec["empty_reason"]:
+                txt = (f"Stufenschnitt {sec['name']} (automatisch): "
+                       + sec["empty_reason"])
+            else:
+                txt = build_section_text(
+                    feats, sec["poly"], sec["hits"], view, sec["direction"],
+                    warn=("WARNUNG" in sec["raw"]), rotation=rotation,
+                    soft=soft, force_keys=sec["force_keys"],
+                    skip_keys=skip_keys, name=sec["name"],
+                    prior_keys=sec["prior_keys"],
+                    planned_without=sec["plan_prior_keys"])
+        else:
+            txt = manual_section_text(feats, sec)
+        sec["text"] = txt
+        texts.append(txt)
+    texts.append(sections_summary(feats, [sections[k] for k in order],
+                                  skip_keys))
+    section_txt = "\n\n".join(texts)
 
-    mapping = renumber_by_section(feats, hits2 if renumber_source == "B"
-                                  else hits)
-    soft_sum = {mapping.get(t, t): n for t, n in soft_sum.items()}
-    section_txt = build_section_text(feats, poly, hits, view, direction,
-                                     warn=("WARNUNG" in raw_txt),
-                                     rotation=rotation, soft=soft_sum,
-                                     force_keys=force_keys,
-                                     skip_keys=skip_keys)
     if "outline_cache" not in geo:
         geo["outline_cache"] = {}
     ck = (view, int(rotation) % 360)
     if ck not in geo["outline_cache"]:
         geo["outline_cache"][ck] = outline_curves(geo["shape"], view,
                                                   rotation)
+    first = sections[0]
+    second = next((x for x in sections[1:] if x["mode"] == "manual"), None)
     res = dict(geo)
     res.update({
         "view": view,
-        "direction": direction,
+        "direction": first["direction"],
         "rotation": int(rotation) % 360,
         "bounds": bnds,
         "outline": geo["outline_cache"][ck],
-        "section_poly": poly,
-        "section_hits": hits,
+        "sections": sections,
+        "section_poly": first["poly"],
+        "section_hits": first["hits"],
         "section_text": section_txt,
-        "section2_poly": poly2,
-        "section2_hits": hits2,
-        "renumber_source": renumber_source,
+        # Kompatibilitaet (aeltere Aufrufer): erster manueller Schnitt
+        "section2_poly": second["poly"] if second else [],
+        "section2_hits": second["hits"] if second else [],
+        "renumber_source": "A",
+        "number_start": start,
     })
     return res
+
+
+def _type_list(nums):
+    """[1,2,3,5,7,8] -> '1-3, 5, 7, 8'"""
+    nums = sorted(set(nums))
+    out, i = [], 0
+    while i < len(nums):
+        j = i
+        while j + 1 < len(nums) and nums[j + 1] == nums[j] + 1:
+            j += 1
+        out.append(str(nums[i]) if j == i else
+                   (f"{nums[i]}, {nums[j]}" if j == i + 1
+                    else f"{nums[i]}-{nums[j]}"))
+        i = j + 1
+    return ", ".join(out)
+
+
+def manual_section_text(features, sec):
+    name = sec["name"]
+    if not sec["poly"]:
+        return (f"Stufenschnitt {name} (manuell): "
+                + (sec.get("empty_reason") or "keine Bohrung ausgewaehlt."))
+    dname = ("horizontal (links -> rechts)" if sec["direction"] == "horizontal"
+             else "vertikal (unten -> oben)")
+    lines = [f"Stufenschnitt {name} (manuell), Richtung: {dname}"]
+    for i, (u, v) in enumerate(sec["poly"]):
+        lines.append(f"  P{i+1}: ({u:.1f}, {v:.1f})")
+    hits = sec["hits"]
+    lines.append("Geschnittene Bohrungen in Schnittreihenfolge: "
+                 + ", ".join(f"#{f.type_no}" for f in hits)
+                 + f"  ({len(hits)} Bohrungen, "
+                   f"{len(set(f.type_no for f in hits))} Typen)")
+    prior = sorted({f.type_no for f in hits
+                    if type_key(f) in sec["prior_keys"]})
+    if prior:
+        lines.append("Bereits in frueheren Schnitten (keine neue Nummer): "
+                     "Typ " + _type_list(prior))
+    return "\n".join(lines)
+
+
+def sections_summary(features, sections, skip_keys=frozenset()):
+    """Uebersicht: welche Typen kommen in welchem Schnitt neu dazu, welche
+    sind noch in keinem Schnitt."""
+    by_key = {}
+    for f in features:
+        by_key.setdefault(type_key(f), f.type_no)
+    lines = ["UEBERSICHT DER SCHNITTE (Bohrnummern fortlaufend in dieser "
+             "Reihenfolge: " + " -> ".join(x["name"] for x in sections)
+             + ")"]
+    covered = set()
+    for sec in sections:
+        nums = [by_key[k] for k in sec["new_keys"] if k in by_key]
+        covered |= set(sec["new_keys"])
+        mode = "automatisch" if sec["mode"] == "auto" else "manuell"
+        lines.append(f"  Schnitt {sec['name']} ({mode}): "
+                     + (f"neu Typ {_type_list(nums)}" if nums
+                        else "keine neuen Typen"))
+    rest = sorted(n for k, n in by_key.items()
+                  if k not in covered and k not in skip_keys)
+    skipped = sorted(n for k, n in by_key.items()
+                     if k not in covered and k in skip_keys)
+    if rest:
+        lines.append(f"  Noch in keinem Schnitt: Typ {_type_list(rest)}")
+    else:
+        lines.append("  Alle Bohrungstypen sind in einem Schnitt enthalten.")
+    if skipped:
+        lines.append(f"  (Nicht noetig markiert: Typ {_type_list(skipped)})")
+    return "\n".join(lines)
 
 
 def analyze(shape_or_path, view="top", thread_map=None,
@@ -1982,7 +2189,9 @@ def renumber_by_section(features, hits):
 
 def build_section_text(features, poly, hits, view, direction, warn=False,
                        cluster_tol=1.0, rotation=0, soft=None,
-                       force_keys=frozenset(), skip_keys=frozenset()):
+                       force_keys=frozenset(), skip_keys=frozenset(),
+                       name="A-A", prior_keys=frozenset(),
+                       planned_without=frozenset()):
     if not poly:
         return "Keine schnittbaren Bohrungen in dieser Ansicht."
     horiz = (direction == "horizontal")
@@ -2002,7 +2211,7 @@ def build_section_text(features, poly, hits, view, direction, warn=False,
         return cov, (s1 - s0)
     dname = ("horizontal (links -> rechts)" if horiz
              else "vertikal (unten -> oben)")
-    txt = [f"Stufenschnitt A-A, Richtung: {dname}",
+    txt = [f"Stufenschnitt {name} (automatisch), Richtung: {dname}",
            "Verlauf (u=Bild-x, v=Bild-y), monoton, Knicke ausserhalb der "
            "Bohrungen:"]
     for i, (u, v) in enumerate(poly):
@@ -2039,6 +2248,10 @@ def build_section_text(features, poly, hits, view, direction, warn=False,
                                in sorted(soft.items())))
     skip_t = set(f.type_no for f in features if type_key(f) in skip_keys)
     force_t = set(f.type_no for f in features if type_key(f) in force_keys)
+    prior_t = set(f.type_no for f in features if type_key(f) in prior_keys)
+    if prior_t & hit_t:
+        txt.append("Bereits in frueheren Schnitten (keine neue Nummer): Typ "
+                   + _type_list(prior_t & hit_t))
     if force_t:
         ok_f = sorted(force_t & hit_t)
         bad_f = sorted(force_t - hit_t)
@@ -2051,9 +2264,12 @@ def build_section_text(features, poly, hits, view, direction, warn=False,
     if skip_t:
         txt.append("Als 'nicht noetig' markiert: Typ "
                    + ", ".join(map(str, sorted(skip_t))))
-    miss = sorted(reach_t - hit_t - skip_t)
+    plan_t = set(f.type_no for f in features
+                 if type_key(f) in planned_without)
+    miss = sorted(reach_t - hit_t - skip_t - prior_t - plan_t)
     if miss:
-        txt.append("Nicht schneidbar ohne Regelverletzung (Umgebung zu "
+        txt.append(f"In {name} nicht schneidbar ohne Regelverletzung "
+                   "(ggf. weiteren Schnitt hinzufuegen; Umgebung zu "
                    "dicht / jede Zufahrt wuerde Nachbarbohrungen "
                    "aussermittig anschneiden): Typ "
                    + ", ".join(str(m) for m in miss))
@@ -2075,19 +2291,19 @@ def outline_curves(shape, view, rotation=0, max_pts=60000):
     total = 0
     ex = TopExp_Explorer(shape, TopAbs_FACE)
     while ex.More():
-        face = TopoDS.Face_s(ex.Current())
+        face = ocp_static(TopoDS, "Face")(ex.Current())
         ad = BRepAdaptor_Surface(face)
         if ad.GetType() == GeomAbs_Plane:
             nrm = ad.Plane().Axis().Direction()
             if abs(nrm.X()*vd[0] + nrm.Y()*vd[1] + nrm.Z()*vd[2]) > 0.999:
                 try:
-                    wire = BRepTools.OuterWire_s(face)
+                    wire = ocp_static(BRepTools, "OuterWire")(face)
                 except Exception:
                     ex.Next()
                     continue
                 wex = TopExp_Explorer(wire, TopAbs_EDGE)
                 while wex.More():
-                    e = TopoDS.Edge_s(wex.Current())
+                    e = ocp_static(TopoDS, "Edge")(wex.Current())
                     try:
                         c = BRepAdaptor_Curve(e)
                         p0, p1 = c.FirstParameter(), c.LastParameter()

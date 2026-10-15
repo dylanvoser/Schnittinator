@@ -21,6 +21,16 @@ datas += ocp_datas
 binaries += ocp_binaries
 hiddenimports += ocp_hiddenimports
 
+# Drag & Drop (tkinterdnd2 + native tkdnd-Bibliothek). Fehlt das Paket,
+# wird ohne Drag & Drop gebaut (Programm laeuft trotzdem).
+try:
+    dnd_datas, dnd_binaries, dnd_hiddenimports = collect_all('tkinterdnd2')
+    datas += dnd_datas
+    binaries += dnd_binaries
+    hiddenimports += dnd_hiddenimports
+except Exception:
+    print("WARNUNG: tkinterdnd2 nicht installiert -> EXE ohne Drag & Drop")
+
 block_cipher = None
 
 a = Analysis(
@@ -32,7 +42,13 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    excludes=[
+        # Programm nutzt tkinter, kein Qt. Die Spyder-Umgebung bringt aber
+        # PyQt5 UND PySide6 mit -> PyInstaller bricht sonst ab ("multiple
+        # Qt bindings packages").
+        'PyQt5', 'PyQt6', 'PySide2', 'PySide6', 'qtpy',
+        'IPython', 'jupyter_client', 'spyder', 'spyder_kernels',
+    ],
     noarchive=False,
     cipher=block_cipher,
 )
